@@ -11,12 +11,16 @@ from discord.ext import commands
 from config import SCHEDULED_CHANNEL_ID
 from database import (
     IMAGES_DIR,
-    add_reaction,
+    add_claim,
+    add_unavailable,
     delete_post_by_message_id,
+    get_all_scheduled_posts,
+    get_claimers_for_post,
+    get_post_by_id,
     get_post_by_message_id,
-    get_reactions_for_post,
+    get_unavailable_for_post,
     insert_post,
-    remove_reaction,
+    update_post_message_id,
 )
 
 log = logging.getLogger("rota-bot.schedule")
@@ -39,11 +43,16 @@ TIMEZONE_CHOICES = [
 
 
 def _quote_content(content: str) -> str:
-    """Prefix every line with > for Discord quote formatting."""
     return "\n".join(f"> {line}" for line in content.split("\n"))
 
 
-def format_scheduled_message(content: str, scheduled_at: int, created_by_id: str, claimers: list[str] | None = None) -> str:
+def format_scheduled_message(
+    content: str,
+    scheduled_at: int,
+    created_by_id: str,
+    claimers: list[str] | None = None,
+    unavailable: list[str] | None = None,
+) -> str:
     lines = [
         "**Scheduled Post**",
         "",
@@ -57,13 +66,25 @@ def format_scheduled_message(content: str, scheduled_at: int, created_by_id: str
         mentions = ", ".join(f"<@{uid}>" for uid in claimers)
         lines.append(f"Claimed by: {mentions}")
     else:
-        lines.append("**Unclaimed** — react to this message to claim it!")
+        lines.append("**Unclaimed** — click Claim to take this post!")
+
+    if unavailable:
+        mentions = ", ".join(f"<@{uid}>" for uid in unavailable)
+        lines.append(f"Not available: {mentions}")
 
     return "\n".join(lines)
 
 
+def get_discord_file(image_path: str | None) -> discord.File | None:
+    if not image_path:
+        return None
+    p = Path(image_path)
+    if p.exists():
+        return discord.File(p, filename=p.name)
+    return None
+
+
 async def save_attachment(attachment: discord.Attachment) -> str | None:
-    """Download an attachment and save it to disk. Returns the file path."""
     ext = Path(attachment.filename).suffix
     filename = f"{uuid.uuid4().hex}{ext}"
     filepath = IMAGES_DIR / filename
@@ -75,14 +96,92 @@ async def save_attachment(attachment: discord.Attachment) -> str | None:
         return None
 
 
-def get_discord_file(image_path: str | None) -> discord.File | None:
-    """Create a discord.File from a saved image path."""
-    if not image_path:
-        return None
-    p = Path(image_path)
-    if p.exists():
-        return discord.File(p, filename=p.name)
-    return None
+class PostButtonView(discord.ui.View):
+    """Buttons attached to each scheduled post message."""
+
+    def __init__(self, bot: commands.Bot, post_id: int):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.post_id = post_id
+
+        claim_btn = discord.ui.Button(
+            label="Claim",
+            style=discord.ButtonStyle.green,
+            custom_id=f"claim:{post_id}",
+        )
+        claim_btn.callback = self._on_claim
+        self.add_item(claim_btn)
+
+        unavail_btn = discord.ui.Button(
+            label="Not available",
+            style=discord.ButtonStyle.red,
+            custom_id=f"unavail:{post_id}",
+        )
+        unavail_btn.callback = self._on_unavailable
+        self.add_item(unavail_btn)
+
+    async def _on_claim(self, interaction: discord.Interaction):
+        await add_claim(self.post_id, str(interaction.user.id))
+        await self._update_message(interaction)
+        log.info(f"User {interaction.user.id} claimed post {self.post_id}")
+
+    async def _on_unavailable(self, interaction: discord.Interaction):
+        await add_unavailable(self.post_id, str(interaction.user.id))
+        await self._update_message(interaction)
+        log.info(f"User {interaction.user.id} marked unavailable for post {self.post_id}")
+
+    async def _update_message(self, interaction: discord.Interaction):
+        post = await get_post_by_id(self.post_id)
+        if not post:
+            await interaction.response.send_message("This post no longer exists.", ephemeral=True)
+            return
+
+        claimers = await get_claimers_for_post(self.post_id)
+        unavailable = await get_unavailable_for_post(self.post_id)
+
+        new_content = format_scheduled_message(
+            post["content"], post["scheduled_at"], post["created_by"], claimers, unavailable
+        )
+        await interaction.response.edit_message(content=new_content)
+
+
+async def repost_all_scheduled(bot: commands.Bot):
+    """Delete all bot messages in the scheduled channel and repost everything in chronological order."""
+    channel = bot.get_channel(SCHEDULED_CHANNEL_ID)
+    if not channel:
+        log.warning("Cannot repost: scheduled channel not found")
+        return
+
+    posts = await get_all_scheduled_posts()
+
+    # Collect old message IDs so we know which ones to ignore in the delete handler
+    old_message_ids = {p["discord_message_id"] for p in posts}
+
+    # Invalidate all message IDs in DB first so on_raw_message_delete won't remove posts
+    for post in posts:
+        await update_post_message_id(post["id"], f"reposting_{post['id']}")
+
+    # Delete all bot messages from the channel
+    async for msg in channel.history(limit=500):
+        if msg.author == bot.user:
+            try:
+                await msg.delete()
+            except discord.NotFound:
+                pass
+
+    # Repost in chronological order (ASC = soonest last = soonest at bottom of chat)
+    for post in posts:
+        claimers = await get_claimers_for_post(post["id"])
+        unavailable = await get_unavailable_for_post(post["id"])
+        content = format_scheduled_message(
+            post["content"], post["scheduled_at"], post["created_by"], claimers, unavailable
+        )
+        view = PostButtonView(bot, post["id"])
+        file = get_discord_file(post.get("image_path"))
+        msg = await channel.send(content, view=view, file=file)
+        await update_post_message_id(post["id"], str(msg.id))
+
+    log.info(f"Reposted {len(posts)} scheduled posts in chronological order")
 
 
 class PostContentModal(discord.ui.Modal, title="Write your post"):
@@ -197,7 +296,7 @@ class ScheduleView(discord.ui.View):
         parts = [f"**Scheduling post:**\n{_quote_content(preview)}\n"]
 
         if self.image_path:
-            parts.append("📎 Image attached\n")
+            parts.append("Image attached\n")
 
         day_str = self.selected_day or "—"
         hour_str = f"{self.selected_hour:02d}" if self.selected_hour is not None else "—"
@@ -232,17 +331,9 @@ class ScheduleView(discord.ui.View):
             )
             return
 
-        channel = self.bot.get_channel(SCHEDULED_CHANNEL_ID)
-        if not channel:
-            await interaction.response.edit_message(content="Could not find the scheduled posts channel.", view=None)
-            return
-
-        msg_content = format_scheduled_message(self.content, unix_ts, str(self.user_id))
-        file = get_discord_file(self.image_path)
-        msg = await channel.send(msg_content, file=file)
-
+        # Insert with a placeholder message ID — repost will fix it
         await insert_post(
-            discord_message_id=str(msg.id),
+            discord_message_id="pending",
             content=self.content,
             scheduled_at=unix_ts,
             created_by=str(self.user_id),
@@ -250,10 +341,14 @@ class ScheduleView(discord.ui.View):
         )
 
         await interaction.response.edit_message(
-            content=f"Post scheduled for <t:{unix_ts}:F> (<t:{unix_ts}:R>).\nThe message has been posted in <#{SCHEDULED_CHANNEL_ID}> — others can react to claim it.",
+            content=f"Post scheduled for <t:{unix_ts}:F> (<t:{unix_ts}:R>). Updating the schedule...",
             view=None,
         )
-        log.info(f"Post scheduled by {self.user_id} for {dt.isoformat()}, message {msg.id}")
+
+        # Repost everything in chronological order
+        await repost_all_scheduled(self.bot)
+
+        log.info(f"Post scheduled by {self.user_id} for {dt.isoformat()}")
         self.stop()
 
     async def _on_day_select(self, interaction: discord.Interaction):
@@ -290,11 +385,17 @@ class ScheduleView(discord.ui.View):
 class ScheduleCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._startup_done = False
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if self._startup_done:
+            return
+        self._startup_done = True
+        await repost_all_scheduled(self.bot)
 
     @app_commands.command(name="schedule", description="Schedule a post for X")
-    @app_commands.describe(
-        image="Optional image to include with the post",
-    )
+    @app_commands.describe(image="Optional image to include with the post")
     async def schedule(self, interaction: discord.Interaction, image: discord.Attachment | None = None):
         if interaction.channel_id != SCHEDULED_CHANNEL_ID:
             await interaction.response.send_message(
@@ -323,60 +424,6 @@ class ScheduleCog(commands.Cog):
         await interaction.response.send_modal(modal)
 
     @commands.Cog.listener()
-    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
-        if payload.channel_id != SCHEDULED_CHANNEL_ID:
-            return
-        if payload.user_id == self.bot.user.id:
-            return
-
-        post = await get_post_by_message_id(str(payload.message_id))
-        if not post or post["status"] != "scheduled":
-            return
-
-        await add_reaction(post["id"], str(payload.user_id))
-
-        claimers = await get_reactions_for_post(post["id"])
-        channel = self.bot.get_channel(SCHEDULED_CHANNEL_ID)
-        if channel:
-            try:
-                msg = await channel.fetch_message(payload.message_id)
-                new_content = format_scheduled_message(
-                    post["content"], post["scheduled_at"], post["created_by"], claimers
-                )
-                await msg.edit(content=new_content)
-            except discord.NotFound:
-                pass
-
-        log.info(f"Reaction added by {payload.user_id} on post {post['id']}")
-
-    @commands.Cog.listener()
-    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
-        if payload.channel_id != SCHEDULED_CHANNEL_ID:
-            return
-        if payload.user_id == self.bot.user.id:
-            return
-
-        post = await get_post_by_message_id(str(payload.message_id))
-        if not post or post["status"] != "scheduled":
-            return
-
-        await remove_reaction(post["id"], str(payload.user_id))
-
-        claimers = await get_reactions_for_post(post["id"])
-        channel = self.bot.get_channel(SCHEDULED_CHANNEL_ID)
-        if channel:
-            try:
-                msg = await channel.fetch_message(payload.message_id)
-                new_content = format_scheduled_message(
-                    post["content"], post["scheduled_at"], post["created_by"], claimers
-                )
-                await msg.edit(content=new_content)
-            except discord.NotFound:
-                pass
-
-        log.info(f"Reaction removed by {payload.user_id} on post {post['id']}")
-
-    @commands.Cog.listener()
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
         if payload.channel_id != SCHEDULED_CHANNEL_ID:
             return
@@ -389,6 +436,9 @@ class ScheduleCog(commands.Cog):
 
         await delete_post_by_message_id(str(payload.message_id))
         log.info(f"Cancelled post {post['id']} (message {payload.message_id} was deleted)")
+
+        # Repost remaining posts in order
+        await repost_all_scheduled(self.bot)
 
 
 async def setup(bot: commands.Bot):

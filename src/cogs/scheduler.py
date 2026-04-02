@@ -9,11 +9,13 @@ from discord.ext import commands, tasks
 from config import ARCHIVE_CHANNEL_ID, REMINDERS_CHANNEL_ID, SCHEDULED_CHANNEL_ID
 from database import (
     get_active_user_ids,
+    get_available_active_user_ids,
+    get_claimers_for_post,
     get_due_posts,
-    get_posts_without_reactions_in_range,
-    get_reactions_for_post,
+    get_posts_without_claims_in_range,
     get_scheduled_posts_in_range,
     mark_post_live,
+    update_post_message_id,
 )
 
 
@@ -73,17 +75,17 @@ class SchedulerCog(commands.Cog):
         reminders_channel = self.bot.get_channel(REMINDERS_CHANNEL_ID)
 
         for post in due_posts:
-            # Mark live and gather claimers BEFORE deleting the message,
-            # because deleting triggers on_raw_message_delete which would
-            # wipe the DB entry and cascade-delete reactions.
             await mark_post_live(post["id"])
-            claimers = await get_reactions_for_post(post["id"])
+            claimers = await get_claimers_for_post(post["id"])
+
+            # Invalidate message ID so the delete event doesn't remove the post
+            await update_post_message_id(post["id"], f"live_{post['id']}")
 
             if schedule_channel:
                 try:
                     msg = await schedule_channel.fetch_message(int(post["discord_message_id"]))
                     await msg.delete()
-                except discord.NotFound:
+                except (discord.NotFound, ValueError):
                     pass
                 except discord.Forbidden:
                     log.warning(f"No permission to delete message {post['discord_message_id']}")
@@ -100,6 +102,7 @@ class SchedulerCog(commands.Cog):
                 )
                 file = _get_discord_file(post.get("image_path"))
                 await archive_channel.send(archive_text, file=file)
+
             if reminders_channel and claimers:
                 mentions = " ".join(f"<@{uid}>" for uid in claimers)
                 await reminders_channel.send(
@@ -108,9 +111,9 @@ class SchedulerCog(commands.Cog):
                     f"{mentions}"
                 )
             elif reminders_channel:
-                active_users = await get_active_user_ids()
-                if active_users:
-                    mentions = " ".join(f"<@{uid}>" for uid in active_users)
+                available = await get_available_active_user_ids(post["id"])
+                if available:
+                    mentions = " ".join(f"<@{uid}>" for uid in available)
                     await reminders_channel.send(
                         f"A post just went live but **nobody claimed it**! Someone needs to share the link and engage.\n\n"
                         f"{_quote_content(post['content'])}\n\n"
@@ -122,7 +125,6 @@ class SchedulerCog(commands.Cog):
             log.info(f"Post {post['id']} went live and moved to archive")
 
     async def _check_pre_post_reminders(self):
-        """Remind the assigned person 15 minutes before their post goes live."""
         now = int(time.time())
         upcoming = await get_scheduled_posts_in_range(now, now + SECONDS_15_MIN)
 
@@ -134,7 +136,7 @@ class SchedulerCog(commands.Cog):
             if post["id"] in self._reminded_pre_post:
                 continue
 
-            claimers = await get_reactions_for_post(post["id"])
+            claimers = await get_claimers_for_post(post["id"])
             if claimers:
                 mentions = " ".join(f"<@{uid}>" for uid in claimers)
                 await reminders_channel.send(
@@ -143,21 +145,20 @@ class SchedulerCog(commands.Cog):
                     f"{mentions}"
                 )
             else:
-                active_users = await get_active_user_ids()
-                if active_users:
-                    mentions = " ".join(f"<@{uid}>" for uid in active_users)
+                available = await get_available_active_user_ids(post["id"])
+                if available:
+                    mentions = " ".join(f"<@{uid}>" for uid in available)
                     await reminders_channel.send(
                         f"A post goes live <t:{post['scheduled_at']}:R> and **still nobody has claimed it**!\n\n"
                         f"{_quote_content(post['content'])}\n\n"
-                        f"React to the post in <#{SCHEDULED_CHANNEL_ID}> to claim it.\n\n"
+                        f"Claim it in <#{SCHEDULED_CHANNEL_ID}>.\n\n"
                         f"{mentions}"
                     )
             self._reminded_pre_post.add(post["id"])
 
     async def _check_unassigned_posts(self):
-        """Alert active members about posts going live within 4 hours that nobody claimed."""
         now = int(time.time())
-        unassigned = await get_posts_without_reactions_in_range(now, now + SECONDS_4_HOURS)
+        unassigned = await get_posts_without_claims_in_range(now, now + SECONDS_4_HOURS)
 
         reminders_channel = self.bot.get_channel(REMINDERS_CHANNEL_ID)
         if not reminders_channel:
@@ -167,19 +168,18 @@ class SchedulerCog(commands.Cog):
             if post["id"] in self._reminded_unassigned:
                 continue
 
-            active_users = await get_active_user_ids()
-            if active_users:
-                mentions = " ".join(f"<@{uid}>" for uid in active_users)
+            available = await get_available_active_user_ids(post["id"])
+            if available:
+                mentions = " ".join(f"<@{uid}>" for uid in available)
                 await reminders_channel.send(
                     f"This post goes live <t:{post['scheduled_at']}:R> and **nobody has claimed it**!\n\n"
                     f"{_quote_content(post['content'])}\n\n"
-                    f"React to the post in <#{SCHEDULED_CHANNEL_ID}> to claim it.\n\n"
+                    f"Claim it in <#{SCHEDULED_CHANNEL_ID}>.\n\n"
                     f"{mentions}"
                 )
             self._reminded_unassigned.add(post["id"])
 
     async def _check_daily_gap(self):
-        """Once per day (at 20:00 UTC), check if the next 24 hours have fewer than 2 posts."""
         utc_now = datetime.now(timezone.utc)
         today_key = utc_now.strftime("%Y-%m-%d")
 

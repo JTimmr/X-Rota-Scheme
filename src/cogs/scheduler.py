@@ -1,6 +1,7 @@
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import discord
 from discord.ext import commands, tasks
@@ -14,6 +15,19 @@ from database import (
     get_scheduled_posts_in_range,
     mark_post_live,
 )
+
+
+def _get_discord_file(image_path: str | None) -> discord.File | None:
+    if not image_path:
+        return None
+    p = Path(image_path)
+    if p.exists():
+        return discord.File(p, filename=p.name)
+    return None
+
+
+def _quote_content(content: str) -> str:
+    return "\n".join(f"> {line}" for line in content.split("\n"))
 
 log = logging.getLogger("rota-bot.scheduler")
 
@@ -79,17 +93,18 @@ class SchedulerCog(commands.Cog):
                 archive_text = (
                     f"**Post went live** <t:{live_ts}:F>\n"
                     f"\n"
-                    f"> {post['content']}\n"
+                    f"{_quote_content(post['content'])}\n"
                     f"\n"
                     f"Originally scheduled for: <t:{post['scheduled_at']}:F>\n"
                     f"Scheduled by: <@{post['created_by']}>"
                 )
-                await archive_channel.send(archive_text)
+                file = _get_discord_file(post.get("image_path"))
+                await archive_channel.send(archive_text, file=file)
             if reminders_channel and claimers:
                 mentions = " ".join(f"<@{uid}>" for uid in claimers)
                 await reminders_channel.send(
                     f"Your post just went live! Time to share the link and engage with replies.\n\n"
-                    f"> {post['content']}\n\n"
+                    f"{_quote_content(post['content'])}\n\n"
                     f"{mentions}"
                 )
             elif reminders_channel:
@@ -98,7 +113,7 @@ class SchedulerCog(commands.Cog):
                     mentions = " ".join(f"<@{uid}>" for uid in active_users)
                     await reminders_channel.send(
                         f"A post just went live but **nobody claimed it**! Someone needs to share the link and engage.\n\n"
-                        f"> {post['content']}\n\n"
+                        f"{_quote_content(post['content'])}\n\n"
                         f"{mentions}"
                     )
 
@@ -124,7 +139,7 @@ class SchedulerCog(commands.Cog):
                 mentions = " ".join(f"<@{uid}>" for uid in claimers)
                 await reminders_channel.send(
                     f"Your post goes live <t:{post['scheduled_at']}:R> — get ready to engage!\n\n"
-                    f"> {post['content']}\n\n"
+                    f"{_quote_content(post['content'])}\n\n"
                     f"{mentions}"
                 )
             else:
@@ -133,7 +148,7 @@ class SchedulerCog(commands.Cog):
                     mentions = " ".join(f"<@{uid}>" for uid in active_users)
                     await reminders_channel.send(
                         f"A post goes live <t:{post['scheduled_at']}:R> and **still nobody has claimed it**!\n\n"
-                        f"> {post['content']}\n\n"
+                        f"{_quote_content(post['content'])}\n\n"
                         f"React to the post in <#{SCHEDULED_CHANNEL_ID}> to claim it.\n\n"
                         f"{mentions}"
                     )
@@ -157,7 +172,7 @@ class SchedulerCog(commands.Cog):
                 mentions = " ".join(f"<@{uid}>" for uid in active_users)
                 await reminders_channel.send(
                     f"This post goes live <t:{post['scheduled_at']}:R> and **nobody has claimed it**!\n\n"
-                    f"> {post['content']}\n\n"
+                    f"{_quote_content(post['content'])}\n\n"
                     f"React to the post in <#{SCHEDULED_CHANNEL_ID}> to claim it.\n\n"
                     f"{mentions}"
                 )

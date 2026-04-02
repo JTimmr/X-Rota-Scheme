@@ -3,10 +3,12 @@ import time
 from pathlib import Path
 
 DB_PATH = Path("/app/data/rota.db")
+IMAGES_DIR = Path("/app/data/images")
 
 
 async def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS posts (
@@ -16,7 +18,8 @@ async def init_db():
                 scheduled_at INTEGER NOT NULL,
                 created_by TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'scheduled',
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                image_path TEXT
             )
         """)
         await db.execute("""
@@ -31,12 +34,19 @@ async def init_db():
         """)
         await db.commit()
 
+        # Migrate: add image_path column if missing (for existing databases)
+        cursor = await db.execute("PRAGMA table_info(posts)")
+        columns = [row[1] async for row in cursor]
+        if "image_path" not in columns:
+            await db.execute("ALTER TABLE posts ADD COLUMN image_path TEXT")
+            await db.commit()
 
-async def insert_post(discord_message_id: str, content: str, scheduled_at: int, created_by: str) -> int:
+
+async def insert_post(discord_message_id: str, content: str, scheduled_at: int, created_by: str, image_path: str | None = None) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "INSERT INTO posts (discord_message_id, content, scheduled_at, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-            (discord_message_id, content, scheduled_at, created_by, int(time.time())),
+            "INSERT INTO posts (discord_message_id, content, scheduled_at, created_by, created_at, image_path) VALUES (?, ?, ?, ?, ?, ?)",
+            (discord_message_id, content, scheduled_at, created_by, int(time.time()), image_path),
         )
         await db.commit()
         return cursor.lastrowid

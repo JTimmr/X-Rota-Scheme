@@ -1,5 +1,7 @@
 import logging
+import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import discord
@@ -8,6 +10,7 @@ from discord.ext import commands
 
 from config import SCHEDULED_CHANNEL_ID
 from database import (
+    IMAGES_DIR,
     add_reaction,
     delete_post_by_message_id,
     get_post_by_message_id,
@@ -35,11 +38,16 @@ TIMEZONE_CHOICES = [
 ]
 
 
+def _quote_content(content: str) -> str:
+    """Prefix every line with > for Discord quote formatting."""
+    return "\n".join(f"> {line}" for line in content.split("\n"))
+
+
 def format_scheduled_message(content: str, scheduled_at: int, created_by_id: str, claimers: list[str] | None = None) -> str:
     lines = [
         "**Scheduled Post**",
         "",
-        f"> {content}",
+        _quote_content(content),
         "",
         f"Scheduled for: <t:{scheduled_at}:F> (<t:{scheduled_at}:R>)",
         f"Scheduled by: <@{created_by_id}>",
@@ -54,12 +62,61 @@ def format_scheduled_message(content: str, scheduled_at: int, created_by_id: str
     return "\n".join(lines)
 
 
+async def save_attachment(attachment: discord.Attachment) -> str | None:
+    """Download an attachment and save it to disk. Returns the file path."""
+    ext = Path(attachment.filename).suffix
+    filename = f"{uuid.uuid4().hex}{ext}"
+    filepath = IMAGES_DIR / filename
+    try:
+        await attachment.save(filepath)
+        return str(filepath)
+    except Exception:
+        log.exception(f"Failed to save attachment {attachment.filename}")
+        return None
+
+
+def get_discord_file(image_path: str | None) -> discord.File | None:
+    """Create a discord.File from a saved image path."""
+    if not image_path:
+        return None
+    p = Path(image_path)
+    if p.exists():
+        return discord.File(p, filename=p.name)
+    return None
+
+
+class PostContentModal(discord.ui.Modal, title="Write your post"):
+    content_input = discord.ui.TextInput(
+        label="Post content",
+        style=discord.TextStyle.long,
+        placeholder="Write your post here... line breaks are preserved!",
+        required=True,
+        max_length=4000,
+    )
+
+    def __init__(self, bot: commands.Bot, user_id: int, image_path: str | None):
+        super().__init__()
+        self.bot = bot
+        self.user_id = user_id
+        self.image_path = image_path
+
+    async def on_submit(self, interaction: discord.Interaction):
+        content = self.content_input.value
+        view = ScheduleView(self.bot, content, self.user_id, self.image_path)
+        await interaction.response.send_message(
+            content=view._status_text(),
+            view=view,
+            ephemeral=True,
+        )
+
+
 class ScheduleView(discord.ui.View):
-    def __init__(self, bot: commands.Bot, content: str, user_id: int):
+    def __init__(self, bot: commands.Bot, content: str, user_id: int, image_path: str | None = None):
         super().__init__(timeout=300)
         self.bot = bot
         self.content = content
         self.user_id = user_id
+        self.image_path = image_path
         self.selected_day: str | None = None
         self.selected_hour: int | None = None
         self.selected_minute: int | None = None
@@ -72,13 +129,33 @@ class ScheduleView(discord.ui.View):
     def _build_selects(self):
         self.clear_items()
 
+        if self.tz_visible:
+            tz_select = discord.ui.Select(
+                custom_id="tz_select",
+                placeholder="Select timezone",
+                row=0,
+            )
+            for label, value in TIMEZONE_CHOICES:
+                tz_select.add_option(label=label, value=value, default=(self.timezone == value))
+            tz_select.callback = self._on_tz_select
+            self.add_item(tz_select)
+        else:
+            tz_button = discord.ui.Button(
+                label="Change timezone (default: UK)",
+                style=discord.ButtonStyle.secondary,
+                custom_id="tz_button",
+                row=0,
+            )
+            tz_button.callback = self._on_tz_button
+            self.add_item(tz_button)
+
         now = datetime.now(tz=ZoneInfo(self.timezone))
         today = now.date()
 
         day_select = discord.ui.Select(
             custom_id="day_select",
             placeholder="Select day",
-            row=0,
+            row=1,
         )
         for offset in range(7):
             day = today + timedelta(days=offset)
@@ -96,7 +173,7 @@ class ScheduleView(discord.ui.View):
         hour_select = discord.ui.Select(
             custom_id="hour_select",
             placeholder="Select hour",
-            row=1,
+            row=2,
         )
         for h in range(6, 23):
             label = f"{h:02d}:00"
@@ -107,7 +184,7 @@ class ScheduleView(discord.ui.View):
         minute_select = discord.ui.Select(
             custom_id="minute_select",
             placeholder="Select minutes",
-            row=2,
+            row=3,
         )
         for m in [0, 15, 30, 45]:
             label = f":{m:02d}"
@@ -115,37 +192,18 @@ class ScheduleView(discord.ui.View):
         minute_select.callback = self._on_minute_select
         self.add_item(minute_select)
 
-        if self.tz_visible:
-            tz_select = discord.ui.Select(
-                custom_id="tz_select",
-                placeholder="Select timezone",
-                row=3,
-            )
-            for label, value in TIMEZONE_CHOICES:
-                tz_select.add_option(label=label, value=value, default=(self.timezone == value))
-            tz_select.callback = self._on_tz_select
-            self.add_item(tz_select)
-        else:
-            tz_button = discord.ui.Button(
-                label="Change timezone (default: UK)",
-                style=discord.ButtonStyle.secondary,
-                custom_id="tz_button",
-                row=3,
-            )
-            tz_button.callback = self._on_tz_button
-            self.add_item(tz_button)
-
     def _status_text(self) -> str:
-        parts = [f"**Scheduling post:**\n> {self.content}\n"]
+        preview = self.content[:100] + ("..." if len(self.content) > 100 else "")
+        parts = [f"**Scheduling post:**\n{_quote_content(preview)}\n"]
+
+        if self.image_path:
+            parts.append("📎 Image attached\n")
 
         day_str = self.selected_day or "—"
         hour_str = f"{self.selected_hour:02d}" if self.selected_hour is not None else "—"
         minute_str = f"{self.selected_minute:02d}" if self.selected_minute is not None else "—"
 
         parts.append(f"Day: **{day_str}** | Time: **{hour_str}:{minute_str}** | Timezone: **{self.timezone}**")
-
-        if self.selected_day and self.selected_hour is not None and self.selected_minute is not None:
-            parts.append("\nSelecting...")
 
         return "\n".join(parts)
 
@@ -180,13 +238,15 @@ class ScheduleView(discord.ui.View):
             return
 
         msg_content = format_scheduled_message(self.content, unix_ts, str(self.user_id))
-        msg = await channel.send(msg_content)
+        file = get_discord_file(self.image_path)
+        msg = await channel.send(msg_content, file=file)
 
         await insert_post(
             discord_message_id=str(msg.id),
             content=self.content,
             scheduled_at=unix_ts,
             created_by=str(self.user_id),
+            image_path=self.image_path,
         )
 
         await interaction.response.edit_message(
@@ -232,8 +292,10 @@ class ScheduleCog(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="schedule", description="Schedule a post for X")
-    @app_commands.describe(content="The post/tweet text")
-    async def schedule(self, interaction: discord.Interaction, content: str):
+    @app_commands.describe(
+        image="Optional image to include with the post",
+    )
+    async def schedule(self, interaction: discord.Interaction, image: discord.Attachment | None = None):
         if interaction.channel_id != SCHEDULED_CHANNEL_ID:
             await interaction.response.send_message(
                 f"This command can only be used in <#{SCHEDULED_CHANNEL_ID}>.",
@@ -241,12 +303,24 @@ class ScheduleCog(commands.Cog):
             )
             return
 
-        view = ScheduleView(self.bot, content, interaction.user.id)
-        await interaction.response.send_message(
-            content=view._status_text(),
-            view=view,
-            ephemeral=True,
-        )
+        image_path = None
+        if image:
+            if not image.content_type or not image.content_type.startswith("image/"):
+                await interaction.response.send_message(
+                    "That file doesn't look like an image. Please attach a JPG, PNG, GIF, or WebP.",
+                    ephemeral=True,
+                )
+                return
+            image_path = await save_attachment(image)
+            if not image_path:
+                await interaction.response.send_message(
+                    "Failed to save the image. Please try again.",
+                    ephemeral=True,
+                )
+                return
+
+        modal = PostContentModal(self.bot, interaction.user.id, image_path)
+        await interaction.response.send_modal(modal)
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):

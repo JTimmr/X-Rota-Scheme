@@ -178,7 +178,8 @@ async def repost_all_scheduled(bot: commands.Bot):
         )
         view = PostButtonView(bot, post["id"])
         file = get_discord_file(post.get("image_path"))
-        msg = await channel.send(content, view=view, file=file)
+        no_pings = discord.AllowedMentions.none()
+        msg = await channel.send(content, view=view, file=file, allowed_mentions=no_pings)
         await update_post_message_id(post["id"], str(msg.id))
 
     log.info(f"Reposted {len(posts)} scheduled posts in chronological order")

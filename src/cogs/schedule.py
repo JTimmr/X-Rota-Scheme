@@ -1,7 +1,8 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import dateparser
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -17,6 +18,8 @@ from database import (
 )
 
 log = logging.getLogger("rota-bot.schedule")
+
+DEFAULT_TZ = "Europe/London"
 
 
 def format_scheduled_message(content: str, scheduled_at: int, created_by_id: str, claimers: list[str] | None = None) -> str:
@@ -38,6 +41,59 @@ def format_scheduled_message(content: str, scheduled_at: int, created_by_id: str
     return "\n".join(lines)
 
 
+def _generate_time_suggestions(current_input: str) -> list[app_commands.Choice[str]]:
+    """Generate autocomplete suggestions for the time parameter."""
+    now = datetime.now(tz=ZoneInfo(DEFAULT_TZ))
+
+    suggestions: list[tuple[str, str]] = []
+
+    hours = [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+
+    today = now.date()
+    for day_offset in range(7):
+        day = today + timedelta(days=day_offset)
+        if day_offset == 0:
+            day_label = "today"
+        elif day_offset == 1:
+            day_label = "tomorrow"
+        else:
+            day_label = day.strftime("%A %d %b")
+
+        for hour in hours:
+            candidate = datetime(day.year, day.month, day.day, hour, 0, tzinfo=ZoneInfo(DEFAULT_TZ))
+            if candidate <= now:
+                continue
+            label = f"{day_label} {hour:02d}:00"
+            suggestions.append((label, label))
+
+    lower = current_input.lower()
+    filtered = [(label, value) for label, value in suggestions if lower in label.lower()]
+
+    return [app_commands.Choice(name=label, value=value) for label, value in filtered[:25]]
+
+
+def parse_time_input(time_str: str, timezone: str) -> datetime | None:
+    """Parse a time string using dateparser for natural language support."""
+    tz = ZoneInfo(timezone)
+    now = datetime.now(tz=tz)
+
+    settings = {
+        "TIMEZONE": timezone,
+        "RETURN_AS_TIMEZONE_AWARE": True,
+        "PREFER_DATES_FROM": "future",
+        "RELATIVE_BASE": now.replace(tzinfo=None),
+    }
+
+    parsed = dateparser.parse(time_str, settings=settings)
+    if parsed is None:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=tz)
+
+    return parsed
+
+
 class ScheduleCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -45,10 +101,10 @@ class ScheduleCog(commands.Cog):
     @app_commands.command(name="schedule", description="Schedule a post for X")
     @app_commands.describe(
         content="The post/tweet text",
-        time="Scheduled datetime, e.g. 2026-04-03 14:00",
-        timezone="IANA timezone, e.g. Europe/London (defaults to UTC)",
+        time="When to post, e.g. 'tomorrow 3pm', 'friday 14:00', '2026-04-05 10:00'",
+        timezone="IANA timezone, e.g. Europe/London (defaults to Europe/London)",
     )
-    async def schedule(self, interaction: discord.Interaction, content: str, time: str, timezone: str = "Europe/London"):
+    async def schedule(self, interaction: discord.Interaction, content: str, time: str, timezone: str = DEFAULT_TZ):
         if interaction.channel_id != SCHEDULED_CHANNEL_ID:
             await interaction.response.send_message(
                 f"This command can only be used in <#{SCHEDULED_CHANNEL_ID}>.",
@@ -57,7 +113,7 @@ class ScheduleCog(commands.Cog):
             return
 
         try:
-            tz = ZoneInfo(timezone)
+            ZoneInfo(timezone)
         except (ZoneInfoNotFoundError, KeyError):
             await interaction.response.send_message(
                 f"Unknown timezone `{timezone}`. Use an IANA timezone like `Europe/London` or `America/New_York`.",
@@ -65,16 +121,19 @@ class ScheduleCog(commands.Cog):
             )
             return
 
-        try:
-            dt = datetime.strptime(time, "%Y-%m-%d %H:%M")
-        except ValueError:
+        dt = parse_time_input(time, timezone)
+        if dt is None:
             await interaction.response.send_message(
-                "Invalid time format. Use `YYYY-MM-DD HH:MM`, e.g. `2026-04-03 14:00`.",
+                "Couldn't understand that time. Try something like:\n"
+                "• `tomorrow 3pm`\n"
+                "• `friday 14:00`\n"
+                "• `next monday 9:00`\n"
+                "• `in 2 hours`\n"
+                "• `2026-04-05 10:00`",
                 ephemeral=True,
             )
             return
 
-        dt = dt.replace(tzinfo=tz)
         unix_ts = int(dt.timestamp())
 
         now_unix = int(datetime.now(tz=ZoneInfo("UTC")).timestamp())
@@ -101,10 +160,14 @@ class ScheduleCog(commands.Cog):
         )
 
         await interaction.response.send_message(
-            f"Post scheduled for <t:{unix_ts}:F>. The message has been posted above — others can react to claim it.",
+            f"Post scheduled for <t:{unix_ts}:F> (<t:{unix_ts}:R>). The message has been posted above — others can react to claim it.",
             ephemeral=True,
         )
         log.info(f"Post scheduled by {interaction.user} for {dt.isoformat()}, message {msg.id}")
+
+    @schedule.autocomplete("time")
+    async def time_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        return _generate_time_suggestions(current)
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):

@@ -1,8 +1,7 @@
 import logging
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
-import dateparser
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -21,16 +20,29 @@ log = logging.getLogger("rota-bot.schedule")
 
 DEFAULT_TZ = "Europe/London"
 
+TIMEZONE_CHOICES = [
+    ("UK — Europe/London", "Europe/London"),
+    ("CET — Europe/Amsterdam", "Europe/Amsterdam"),
+    ("EET — Europe/Bucharest", "Europe/Bucharest"),
+    ("US Eastern — America/New_York", "America/New_York"),
+    ("US Central — America/Chicago", "America/Chicago"),
+    ("US Pacific — America/Los_Angeles", "America/Los_Angeles"),
+    ("IST — Asia/Kolkata", "Asia/Kolkata"),
+    ("JST — Asia/Tokyo", "Asia/Tokyo"),
+    ("AEST — Australia/Sydney", "Australia/Sydney"),
+    ("UTC", "UTC"),
+]
+
 
 def format_scheduled_message(content: str, scheduled_at: int, created_by_id: str, claimers: list[str] | None = None) -> str:
     lines = [
-        f"**Scheduled Post**",
-        f"",
+        "**Scheduled Post**",
+        "",
         f"> {content}",
-        f"",
+        "",
         f"Scheduled for: <t:{scheduled_at}:F> (<t:{scheduled_at}:R>)",
         f"Scheduled by: <@{created_by_id}>",
-        f"",
+        "",
     ]
     if claimers:
         mentions = ", ".join(f"<@{uid}>" for uid in claimers)
@@ -41,57 +53,177 @@ def format_scheduled_message(content: str, scheduled_at: int, created_by_id: str
     return "\n".join(lines)
 
 
-def _generate_time_suggestions(current_input: str) -> list[app_commands.Choice[str]]:
-    """Generate autocomplete suggestions for the time parameter."""
-    now = datetime.now(tz=ZoneInfo(DEFAULT_TZ))
+class ScheduleView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, content: str, user_id: int):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.content = content
+        self.user_id = user_id
+        self.selected_day: str | None = None
+        self.selected_hour: int | None = None
+        self.selected_minute: int | None = None
+        self.timezone: str = DEFAULT_TZ
+        self.tz_visible = False
+        self.submitted = False
 
-    suggestions: list[tuple[str, str]] = []
+        self._build_selects()
 
-    hours = [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    def _build_selects(self):
+        self.clear_items()
 
-    today = now.date()
-    for day_offset in range(7):
-        day = today + timedelta(days=day_offset)
-        if day_offset == 0:
-            day_label = "today"
-        elif day_offset == 1:
-            day_label = "tomorrow"
+        now = datetime.now(tz=ZoneInfo(self.timezone))
+        today = now.date()
+
+        day_select = discord.ui.Select(
+            custom_id="day_select",
+            placeholder="Select day",
+            row=0,
+        )
+        for offset in range(7):
+            day = today + timedelta(days=offset)
+            value = day.isoformat()
+            if offset == 0:
+                label = f"Today — {day.strftime('%A %d %b')}"
+            elif offset == 1:
+                label = f"Tomorrow — {day.strftime('%A %d %b')}"
+            else:
+                label = day.strftime("%A %d %b")
+            day_select.add_option(label=label, value=value, default=(self.selected_day == value))
+        day_select.callback = self._on_day_select
+        self.add_item(day_select)
+
+        hour_select = discord.ui.Select(
+            custom_id="hour_select",
+            placeholder="Select hour",
+            row=1,
+        )
+        for h in range(6, 23):
+            label = f"{h:02d}:00"
+            hour_select.add_option(label=label, value=str(h), default=(self.selected_hour == h))
+        hour_select.callback = self._on_hour_select
+        self.add_item(hour_select)
+
+        minute_select = discord.ui.Select(
+            custom_id="minute_select",
+            placeholder="Select minutes",
+            row=2,
+        )
+        for m in [0, 15, 30, 45]:
+            label = f":{m:02d}"
+            minute_select.add_option(label=label, value=str(m), default=(self.selected_minute == m))
+        minute_select.callback = self._on_minute_select
+        self.add_item(minute_select)
+
+        if self.tz_visible:
+            tz_select = discord.ui.Select(
+                custom_id="tz_select",
+                placeholder="Select timezone",
+                row=3,
+            )
+            for label, value in TIMEZONE_CHOICES:
+                tz_select.add_option(label=label, value=value, default=(self.timezone == value))
+            tz_select.callback = self._on_tz_select
+            self.add_item(tz_select)
         else:
-            day_label = day.strftime("%A %d %b")
+            tz_button = discord.ui.Button(
+                label="Change timezone (default: UK)",
+                style=discord.ButtonStyle.secondary,
+                custom_id="tz_button",
+                row=3,
+            )
+            tz_button.callback = self._on_tz_button
+            self.add_item(tz_button)
 
-        for hour in hours:
-            candidate = datetime(day.year, day.month, day.day, hour, 0, tzinfo=ZoneInfo(DEFAULT_TZ))
-            if candidate <= now:
-                continue
-            label = f"{day_label} {hour:02d}:00"
-            suggestions.append((label, label))
+    def _status_text(self) -> str:
+        parts = [f"**Scheduling post:**\n> {self.content}\n"]
 
-    lower = current_input.lower()
-    filtered = [(label, value) for label, value in suggestions if lower in label.lower()]
+        day_str = self.selected_day or "—"
+        hour_str = f"{self.selected_hour:02d}" if self.selected_hour is not None else "—"
+        minute_str = f"{self.selected_minute:02d}" if self.selected_minute is not None else "—"
 
-    return [app_commands.Choice(name=label, value=value) for label, value in filtered[:25]]
+        parts.append(f"Day: **{day_str}** | Time: **{hour_str}:{minute_str}** | Timezone: **{self.timezone}**")
 
+        if self.selected_day and self.selected_hour is not None and self.selected_minute is not None:
+            parts.append("\nSelecting...")
 
-def parse_time_input(time_str: str, timezone: str) -> datetime | None:
-    """Parse a time string using dateparser for natural language support."""
-    tz = ZoneInfo(timezone)
-    now = datetime.now(tz=tz)
+        return "\n".join(parts)
 
-    settings = {
-        "TIMEZONE": timezone,
-        "RETURN_AS_TIMEZONE_AWARE": True,
-        "PREFER_DATES_FROM": "future",
-        "RELATIVE_BASE": now.replace(tzinfo=None),
-    }
+    async def _try_submit(self, interaction: discord.Interaction):
+        if self.submitted:
+            return
+        if self.selected_day is None or self.selected_hour is None or self.selected_minute is None:
+            self._build_selects()
+            await interaction.response.edit_message(content=self._status_text(), view=self)
+            return
 
-    parsed = dateparser.parse(time_str, settings=settings)
-    if parsed is None:
-        return None
+        self.submitted = True
 
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=tz)
+        tz = ZoneInfo(self.timezone)
+        day = datetime.fromisoformat(self.selected_day)
+        dt = datetime(day.year, day.month, day.day, self.selected_hour, self.selected_minute, tzinfo=tz)
+        unix_ts = int(dt.timestamp())
 
-    return parsed
+        now_unix = int(datetime.now(tz=ZoneInfo("UTC")).timestamp())
+        if unix_ts <= now_unix:
+            self.submitted = False
+            self._build_selects()
+            await interaction.response.edit_message(
+                content=self._status_text() + "\n\nThat time is in the past. Pick a different day or time.",
+                view=self,
+            )
+            return
+
+        channel = self.bot.get_channel(SCHEDULED_CHANNEL_ID)
+        if not channel:
+            await interaction.response.edit_message(content="Could not find the scheduled posts channel.", view=None)
+            return
+
+        msg_content = format_scheduled_message(self.content, unix_ts, str(self.user_id))
+        msg = await channel.send(msg_content)
+
+        await insert_post(
+            discord_message_id=str(msg.id),
+            content=self.content,
+            scheduled_at=unix_ts,
+            created_by=str(self.user_id),
+        )
+
+        await interaction.response.edit_message(
+            content=f"Post scheduled for <t:{unix_ts}:F> (<t:{unix_ts}:R>).\nThe message has been posted in <#{SCHEDULED_CHANNEL_ID}> — others can react to claim it.",
+            view=None,
+        )
+        log.info(f"Post scheduled by {self.user_id} for {dt.isoformat()}, message {msg.id}")
+        self.stop()
+
+    async def _on_day_select(self, interaction: discord.Interaction):
+        self.selected_day = interaction.data["values"][0]
+        await self._try_submit(interaction)
+
+    async def _on_hour_select(self, interaction: discord.Interaction):
+        self.selected_hour = int(interaction.data["values"][0])
+        await self._try_submit(interaction)
+
+    async def _on_minute_select(self, interaction: discord.Interaction):
+        self.selected_minute = int(interaction.data["values"][0])
+        await self._try_submit(interaction)
+
+    async def _on_tz_button(self, interaction: discord.Interaction):
+        self.tz_visible = True
+        self._build_selects()
+        await interaction.response.edit_message(content=self._status_text(), view=self)
+
+    async def _on_tz_select(self, interaction: discord.Interaction):
+        self.timezone = interaction.data["values"][0]
+        await self._try_submit(interaction)
+
+    async def on_timeout(self):
+        pass
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Only the person who ran /schedule can use this.", ephemeral=True)
+            return False
+        return True
 
 
 class ScheduleCog(commands.Cog):
@@ -99,12 +231,8 @@ class ScheduleCog(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="schedule", description="Schedule a post for X")
-    @app_commands.describe(
-        content="The post/tweet text",
-        time="When to post, e.g. 'tomorrow 3pm', 'friday 14:00', '2026-04-05 10:00'",
-        timezone="IANA timezone, e.g. Europe/London (defaults to Europe/London)",
-    )
-    async def schedule(self, interaction: discord.Interaction, content: str, time: str, timezone: str = DEFAULT_TZ):
+    @app_commands.describe(content="The post/tweet text")
+    async def schedule(self, interaction: discord.Interaction, content: str):
         if interaction.channel_id != SCHEDULED_CHANNEL_ID:
             await interaction.response.send_message(
                 f"This command can only be used in <#{SCHEDULED_CHANNEL_ID}>.",
@@ -112,62 +240,12 @@ class ScheduleCog(commands.Cog):
             )
             return
 
-        try:
-            ZoneInfo(timezone)
-        except (ZoneInfoNotFoundError, KeyError):
-            await interaction.response.send_message(
-                f"Unknown timezone `{timezone}`. Use an IANA timezone like `Europe/London` or `America/New_York`.",
-                ephemeral=True,
-            )
-            return
-
-        dt = parse_time_input(time, timezone)
-        if dt is None:
-            await interaction.response.send_message(
-                "Couldn't understand that time. Try something like:\n"
-                "• `tomorrow 3pm`\n"
-                "• `friday 14:00`\n"
-                "• `next monday 9:00`\n"
-                "• `in 2 hours`\n"
-                "• `2026-04-05 10:00`",
-                ephemeral=True,
-            )
-            return
-
-        unix_ts = int(dt.timestamp())
-
-        now_unix = int(datetime.now(tz=ZoneInfo("UTC")).timestamp())
-        if unix_ts <= now_unix:
-            await interaction.response.send_message(
-                "That time is in the past. Please schedule for a future time.",
-                ephemeral=True,
-            )
-            return
-
-        channel = self.bot.get_channel(SCHEDULED_CHANNEL_ID)
-        if not channel:
-            await interaction.response.send_message("Could not find the scheduled posts channel.", ephemeral=True)
-            return
-
-        msg_content = format_scheduled_message(content, unix_ts, str(interaction.user.id))
-        msg = await channel.send(msg_content)
-
-        await insert_post(
-            discord_message_id=str(msg.id),
-            content=content,
-            scheduled_at=unix_ts,
-            created_by=str(interaction.user.id),
-        )
-
+        view = ScheduleView(self.bot, content, interaction.user.id)
         await interaction.response.send_message(
-            f"Post scheduled for <t:{unix_ts}:F> (<t:{unix_ts}:R>). The message has been posted above — others can react to claim it.",
+            content=view._status_text(),
+            view=view,
             ephemeral=True,
         )
-        log.info(f"Post scheduled by {interaction.user} for {dt.isoformat()}, message {msg.id}")
-
-    @schedule.autocomplete("time")
-    async def time_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-        return _generate_time_suggestions(current)
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):

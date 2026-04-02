@@ -103,11 +103,11 @@ async def get_post_by_message_id(discord_message_id: str) -> dict | None:
 
 
 async def get_all_scheduled_posts() -> list[dict]:
-    """All scheduled posts ordered by scheduled_at ASC (soonest first = bottom of chat)."""
+    """All scheduled posts ordered by scheduled_at DESC (furthest first, soonest last = bottom of chat)."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT * FROM posts WHERE status = 'scheduled' ORDER BY scheduled_at ASC"
+            "SELECT * FROM posts WHERE status = 'scheduled' ORDER BY scheduled_at DESC"
         )
         return [dict(row) async for row in cursor]
 

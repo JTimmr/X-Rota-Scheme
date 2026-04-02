@@ -27,9 +27,10 @@ TIMEZONE_CHOICES = [
     ("US Eastern — America/New_York", "America/New_York"),
     ("US Central — America/Chicago", "America/Chicago"),
     ("US Pacific — America/Los_Angeles", "America/Los_Angeles"),
-    ("IST — Asia/Kolkata", "Asia/Kolkata"),
-    ("JST — Asia/Tokyo", "Asia/Tokyo"),
-    ("AEST — Australia/Sydney", "Australia/Sydney"),
+    ("Dubai — Asia/Dubai", "Asia/Dubai"),
+    ("Vietnam — Asia/Ho_Chi_Minh", "Asia/Ho_Chi_Minh"),
+    ("Jakarta — Asia/Jakarta", "Asia/Jakarta"),
+    ("Brisbane — Australia/Brisbane", "Australia/Brisbane"),
     ("UTC", "UTC"),
 ]
 

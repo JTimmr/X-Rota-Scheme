@@ -20,6 +20,8 @@ from database import (
     get_post_by_message_id,
     get_unavailable_for_post,
     insert_post,
+    remove_claim,
+    remove_unavailable,
     update_post_message_id,
 )
 
@@ -121,14 +123,26 @@ class PostButtonView(discord.ui.View):
         self.add_item(unavail_btn)
 
     async def _on_claim(self, interaction: discord.Interaction):
-        await add_claim(self.post_id, str(interaction.user.id))
+        uid = str(interaction.user.id)
+        claimers = await get_claimers_for_post(self.post_id)
+        if uid in claimers:
+            await remove_claim(self.post_id, uid)
+            log.info(f"User {uid} unclaimed post {self.post_id}")
+        else:
+            await add_claim(self.post_id, uid)
+            log.info(f"User {uid} claimed post {self.post_id}")
         await self._update_message(interaction)
-        log.info(f"User {interaction.user.id} claimed post {self.post_id}")
 
     async def _on_unavailable(self, interaction: discord.Interaction):
-        await add_unavailable(self.post_id, str(interaction.user.id))
+        uid = str(interaction.user.id)
+        unavailable = await get_unavailable_for_post(self.post_id)
+        if uid in unavailable:
+            await remove_unavailable(self.post_id, uid)
+            log.info(f"User {uid} removed unavailable from post {self.post_id}")
+        else:
+            await add_unavailable(self.post_id, uid)
+            log.info(f"User {uid} marked unavailable for post {self.post_id}")
         await self._update_message(interaction)
-        log.info(f"User {interaction.user.id} marked unavailable for post {self.post_id}")
 
     async def _update_message(self, interaction: discord.Interaction):
         post = await get_post_by_id(self.post_id)

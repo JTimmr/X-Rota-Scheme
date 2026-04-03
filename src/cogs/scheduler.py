@@ -101,7 +101,8 @@ class SchedulerCog(commands.Cog):
                     f"Scheduled by: <@{post['created_by']}>"
                 )
                 file = _get_discord_file(post.get("image_path"))
-                await archive_channel.send(archive_text, file=file)
+                no_pings = discord.AllowedMentions.none()
+                await archive_channel.send(archive_text, file=file, allowed_mentions=no_pings)
 
             if reminders_channel and claimers:
                 mentions = " ".join(f"<@{uid}>" for uid in claimers)

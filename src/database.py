@@ -182,6 +182,12 @@ async def add_unavailable(post_id: int, user_id: str):
         await db.commit()
 
 
+async def remove_unavailable(post_id: int, user_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM unavailable WHERE post_id = ? AND user_id = ?", (post_id, user_id))
+        await db.commit()
+
+
 async def get_unavailable_for_post(post_id: int) -> list[str]:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT user_id FROM unavailable WHERE post_id = ?", (post_id,))

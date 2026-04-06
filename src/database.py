@@ -128,6 +128,24 @@ async def mark_post_live(post_id: int):
         await db.commit()
 
 
+async def update_post_content(post_id: int, content: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE posts SET content = ? WHERE id = ?", (content, post_id))
+        await db.commit()
+
+
+async def update_post_scheduled_at(post_id: int, scheduled_at: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE posts SET scheduled_at = ? WHERE id = ?", (scheduled_at, post_id))
+        await db.commit()
+
+
+async def update_post_image(post_id: int, image_path: str | None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE posts SET image_path = ? WHERE id = ?", (image_path, post_id))
+        await db.commit()
+
+
 async def update_post_message_id(post_id: int, new_message_id: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE posts SET discord_message_id = ? WHERE id = ?", (new_message_id, post_id))

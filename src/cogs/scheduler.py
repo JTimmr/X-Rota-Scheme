@@ -6,7 +6,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands, tasks
 
-from config import ARCHIVE_CHANNEL_ID, REMINDERS_CHANNEL_ID, SCHEDULED_CHANNEL_ID
+from config import ARCHIVE_CHANNEL_ID, GUILD_ID, REMINDERS_CHANNEL_ID, SCHEDULED_CHANNEL_ID
 from database import (
     get_active_user_ids,
     get_available_active_user_ids,
@@ -149,10 +149,11 @@ class SchedulerCog(commands.Cog):
                 available = await get_available_active_user_ids(post["id"])
                 if available:
                     mentions = " ".join(f"<@{uid}>" for uid in available)
+                    msg_link = f"https://discord.com/channels/{GUILD_ID}/{SCHEDULED_CHANNEL_ID}/{post['discord_message_id']}"
                     await reminders_channel.send(
                         f"A post goes live <t:{post['scheduled_at']}:R> and **still nobody has claimed it**!\n\n"
                         f"{_quote_content(post['content'])}\n\n"
-                        f"Claim it in <#{SCHEDULED_CHANNEL_ID}>.\n\n"
+                        f"[Jump to post]({msg_link}) to claim it.\n\n"
                         f"{mentions}"
                     )
             self._reminded_pre_post.add(post["id"])
@@ -172,10 +173,11 @@ class SchedulerCog(commands.Cog):
             available = await get_available_active_user_ids(post["id"])
             if available:
                 mentions = " ".join(f"<@{uid}>" for uid in available)
+                msg_link = f"https://discord.com/channels/{GUILD_ID}/{SCHEDULED_CHANNEL_ID}/{post['discord_message_id']}"
                 await reminders_channel.send(
                     f"This post goes live <t:{post['scheduled_at']}:R> and **nobody has claimed it**!\n\n"
                     f"{_quote_content(post['content'])}\n\n"
-                    f"Claim it in <#{SCHEDULED_CHANNEL_ID}>.\n\n"
+                    f"[Jump to post]({msg_link}) to claim it.\n\n"
                     f"{mentions}"
                 )
             self._reminded_unassigned.add(post["id"])

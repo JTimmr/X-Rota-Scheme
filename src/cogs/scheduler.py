@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
@@ -6,7 +7,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands, tasks
 
-from config import ARCHIVE_CHANNEL_ID, GUILD_ID, REMINDERS_CHANNEL_ID, SCHEDULED_CHANNEL_ID
+from config import ARCHIVE_CHANNEL_ID, GUILD_ID, REMINDERS_CHANNEL_ID, SCHEDULED_CHANNEL_ID, X_ENABLED
 from database import (
     get_active_user_ids,
     get_available_active_user_ids,
@@ -16,7 +17,9 @@ from database import (
     get_scheduled_posts_in_range,
     mark_post_live,
     update_post_message_id,
+    update_post_tweet_url,
 )
+from x_client import post_tweet
 
 
 def _get_discord_file(image_path: str | None) -> discord.File | None:
@@ -90,6 +93,16 @@ class SchedulerCog(commands.Cog):
                 except discord.Forbidden:
                     log.warning(f"No permission to delete message {post['discord_message_id']}")
 
+            # Post to X (runs in executor since tweepy is synchronous)
+            tweet_url = None
+            if X_ENABLED:
+                loop = asyncio.get_running_loop()
+                tweet_url = await loop.run_in_executor(
+                    None, post_tweet, post["content"], post.get("image_path")
+                )
+                if tweet_url:
+                    await update_post_tweet_url(post["id"], tweet_url)
+
             if archive_channel:
                 live_ts = int(time.time())
                 archive_text = (
@@ -100,26 +113,34 @@ class SchedulerCog(commands.Cog):
                     f"Originally scheduled for: <t:{post['scheduled_at']}:F>\n"
                     f"Scheduled by: <@{post['created_by']}>"
                 )
+                if tweet_url:
+                    archive_text += f"\n\n{tweet_url}"
                 file = _get_discord_file(post.get("image_path"))
                 no_pings = discord.AllowedMentions.none()
                 await archive_channel.send(archive_text, file=file, allowed_mentions=no_pings)
 
             if reminders_channel and claimers:
                 mentions = " ".join(f"<@{uid}>" for uid in claimers)
-                await reminders_channel.send(
+                reminder_text = (
                     f"Your post just went live! Time to share the link and engage with replies.\n\n"
                     f"{_quote_content(post['content'])}\n\n"
-                    f"{mentions}"
                 )
+                if tweet_url:
+                    reminder_text += f"{tweet_url}\n\n"
+                reminder_text += mentions
+                await reminders_channel.send(reminder_text)
             elif reminders_channel:
                 available = await get_available_active_user_ids(post["id"])
                 if available:
                     mentions = " ".join(f"<@{uid}>" for uid in available)
-                    await reminders_channel.send(
+                    reminder_text = (
                         f"A post just went live but **nobody claimed it**! Someone needs to share the link and engage.\n\n"
                         f"{_quote_content(post['content'])}\n\n"
-                        f"{mentions}"
                     )
+                    if tweet_url:
+                        reminder_text += f"{tweet_url}\n\n"
+                    reminder_text += mentions
+                    await reminders_channel.send(reminder_text)
 
             self._reminded_pre_post.discard(post["id"])
             self._reminded_unassigned.discard(post["id"])

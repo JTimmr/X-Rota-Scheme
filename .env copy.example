@@ -3,9 +3,3 @@ DISCORD_GUILD_ID=your_guild_id_here
 SCHEDULED_CHANNEL_ID=channel_id_for_scheduled_posts
 ARCHIVE_CHANNEL_ID=channel_id_for_historical_posts
 REMINDERS_CHANNEL_ID=channel_id_for_reminders
-
-# X/Twitter API (optional — leave blank to disable auto-posting to X)
-X_API_KEY=
-X_API_SECRET=
-X_ACCESS_TOKEN=
-X_ACCESS_TOKEN_SECRET=

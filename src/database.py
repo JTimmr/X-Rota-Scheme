@@ -52,11 +52,14 @@ async def init_db():
             await db.execute("DROP TABLE reactions")
             await db.commit()
 
-        # Migrate: add image_path column if missing
+        # Migrate: add columns if missing
         cursor = await db.execute("PRAGMA table_info(posts)")
         columns = [row[1] async for row in cursor]
         if "image_path" not in columns:
             await db.execute("ALTER TABLE posts ADD COLUMN image_path TEXT")
+            await db.commit()
+        if "tweet_url" not in columns:
+            await db.execute("ALTER TABLE posts ADD COLUMN tweet_url TEXT")
             await db.commit()
 
 
@@ -143,6 +146,12 @@ async def update_post_scheduled_at(post_id: int, scheduled_at: int):
 async def update_post_image(post_id: int, image_path: str | None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE posts SET image_path = ? WHERE id = ?", (image_path, post_id))
+        await db.commit()
+
+
+async def update_post_tweet_url(post_id: int, tweet_url: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE posts SET tweet_url = ? WHERE id = ?", (tweet_url, post_id))
         await db.commit()
 
 

@@ -66,13 +66,33 @@ async def init_db():
                 "ALTER TABLE posts ADD COLUMN skip_unclaimed_pings INTEGER NOT NULL DEFAULT 0"
             )
             await db.commit()
+        if "post_to_x" not in columns:
+            await db.execute(
+                "ALTER TABLE posts ADD COLUMN post_to_x INTEGER NOT NULL DEFAULT 1"
+            )
+            await db.commit()
 
 
-async def insert_post(discord_message_id: str, content: str, scheduled_at: int, created_by: str, image_path: str | None = None) -> int:
+async def insert_post(
+    discord_message_id: str,
+    content: str,
+    scheduled_at: int,
+    created_by: str,
+    image_path: str | None = None,
+    post_to_x: bool = True,
+) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "INSERT INTO posts (discord_message_id, content, scheduled_at, created_by, created_at, image_path) VALUES (?, ?, ?, ?, ?, ?)",
-            (discord_message_id, content, scheduled_at, created_by, int(time.time()), image_path),
+            "INSERT INTO posts (discord_message_id, content, scheduled_at, created_by, created_at, image_path, post_to_x) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                discord_message_id,
+                content,
+                scheduled_at,
+                created_by,
+                int(time.time()),
+                image_path,
+                1 if post_to_x else 0,
+            ),
         )
         await db.commit()
         return cursor.lastrowid

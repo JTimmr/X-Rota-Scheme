@@ -59,16 +59,27 @@ def format_scheduled_message(
     claimers: list[str] | None = None,
     unavailable: list[str] | None = None,
     skip_unclaimed_pings: bool = False,
+    post_to_x: bool = True,
 ) -> str:
     lines = [
         "**Scheduled Post**",
         "",
-        _quote_content(content),
-        "",
-        f"Scheduled for: <t:{scheduled_at}:F> (<t:{scheduled_at}:R>)",
-        f"Scheduled by: <@{created_by_id}>",
-        "",
     ]
+    if not post_to_x:
+        lines.append(
+            "**Manual X** — the bot will not tweet this. Claimers post on X themselves; "
+            "no tweet links are sent to announcement channels."
+        )
+        lines.append("")
+    lines.extend(
+        [
+            _quote_content(content),
+            "",
+            f"Scheduled for: <t:{scheduled_at}:F> (<t:{scheduled_at}:R>)",
+            f"Scheduled by: <@{created_by_id}>",
+            "",
+        ]
+    )
     if claimers:
         mentions = ", ".join(f"<@{uid}>" for uid in claimers)
         lines.append(f"Claimed by: {mentions}")
@@ -438,6 +449,7 @@ class PostButtonView(discord.ui.View):
         unavailable = await get_unavailable_for_post(self.post_id)
         skip_pings = bool(post.get("skip_unclaimed_pings"))
 
+        post_to_x = bool(post.get("post_to_x", 1))
         new_content = format_scheduled_message(
             post["content"],
             post["scheduled_at"],
@@ -445,6 +457,7 @@ class PostButtonView(discord.ui.View):
             claimers,
             unavailable,
             skip_unclaimed_pings=skip_pings,
+            post_to_x=post_to_x,
         )
         new_view = PostButtonView(self.bot, self.post_id, skip_unclaimed_pings=skip_pings)
         await interaction.response.edit_message(content=new_content, view=new_view)
@@ -480,6 +493,7 @@ async def repost_all_scheduled(bot: commands.Bot):
         claimers = await get_claimers_for_post(post["id"])
         unavailable = await get_unavailable_for_post(post["id"])
         skip_pings = bool(post.get("skip_unclaimed_pings"))
+        post_to_x = bool(post.get("post_to_x", 1))
         content = format_scheduled_message(
             post["content"],
             post["scheduled_at"],
@@ -487,6 +501,7 @@ async def repost_all_scheduled(bot: commands.Bot):
             claimers,
             unavailable,
             skip_unclaimed_pings=skip_pings,
+            post_to_x=post_to_x,
         )
         view = PostButtonView(bot, post["id"], skip_unclaimed_pings=skip_pings)
         file = get_discord_file(post.get("image_path"))
@@ -510,15 +525,16 @@ class PostContentModal(discord.ui.Modal, title="Write your post"):
         max_length=4000,
     )
 
-    def __init__(self, bot: commands.Bot, user_id: int, image_path: str | None):
+    def __init__(self, bot: commands.Bot, user_id: int, image_path: str | None, post_to_x: bool = True):
         super().__init__()
         self.bot = bot
         self.user_id = user_id
         self.image_path = image_path
+        self.post_to_x = post_to_x
 
     async def on_submit(self, interaction: discord.Interaction):
         content = self.content_input.value
-        view = ScheduleView(self.bot, content, self.user_id, self.image_path)
+        view = ScheduleView(self.bot, content, self.user_id, self.image_path, post_to_x=self.post_to_x)
         await interaction.response.send_message(
             content=view._status_text(),
             view=view,
@@ -527,12 +543,20 @@ class PostContentModal(discord.ui.Modal, title="Write your post"):
 
 
 class ScheduleView(discord.ui.View):
-    def __init__(self, bot: commands.Bot, content: str, user_id: int, image_path: str | None = None):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        content: str,
+        user_id: int,
+        image_path: str | None = None,
+        post_to_x: bool = True,
+    ):
         super().__init__(timeout=300)
         self.bot = bot
         self.content = content
         self.user_id = user_id
         self.image_path = image_path
+        self.post_to_x = post_to_x
         self.selected_day: str | None = None
         self.selected_hour: int | None = None
         self.selected_minute: int | None = None
@@ -598,6 +622,9 @@ class ScheduleView(discord.ui.View):
         if self.image_path:
             parts.append("Image attached\n")
 
+        if not self.post_to_x:
+            parts.append("**Manual X** — bot will not tweet; you post on X when the slot is live.\n")
+
         day_str = self.selected_day or "—"
         hour_str = f"{self.selected_hour:02d}" if self.selected_hour is not None else "—"
         minute_str = f"{self.selected_minute:02d}" if self.selected_minute is not None else "—"
@@ -637,6 +664,7 @@ class ScheduleView(discord.ui.View):
             scheduled_at=unix_ts,
             created_by=str(self.user_id),
             image_path=self.image_path,
+            post_to_x=self.post_to_x,
         )
 
         await interaction.response.edit_message(
@@ -697,8 +725,16 @@ class ScheduleCog(commands.Cog):
         await repost_all_scheduled(self.bot)
 
     @app_commands.command(name="schedule", description="Schedule a post for X")
-    @app_commands.describe(image="Optional image to include with the post")
-    async def schedule(self, interaction: discord.Interaction, image: discord.Attachment | None = None):
+    @app_commands.describe(
+        image="Optional image to include with the post",
+        post_to_x="If off, the bot does not tweet or send tweet links; claimers post on X manually. Reminders unchanged.",
+    )
+    async def schedule(
+        self,
+        interaction: discord.Interaction,
+        image: discord.Attachment | None = None,
+        post_to_x: bool = True,
+    ):
         if interaction.channel_id != SCHEDULED_CHANNEL_ID:
             await interaction.response.send_message(
                 f"This command can only be used in <#{SCHEDULED_CHANNEL_ID}>.",
@@ -722,7 +758,7 @@ class ScheduleCog(commands.Cog):
                 )
                 return
 
-        modal = PostContentModal(self.bot, interaction.user.id, image_path)
+        modal = PostContentModal(self.bot, interaction.user.id, image_path, post_to_x=post_to_x)
         await interaction.response.send_modal(modal)
 
     @app_commands.command(name="updatemedia", description="Add or replace the media on a scheduled post")

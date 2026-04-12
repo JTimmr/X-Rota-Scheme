@@ -44,6 +44,11 @@ def _quote_content(content: str) -> str:
 log = logging.getLogger("rota-bot.scheduler")
 
 SECONDS_15_MIN = 15 * 60
+
+
+def _post_to_x(post: dict) -> bool:
+    """If False, bot does not tweet or broadcast tweet URLs; claimer handles X manually."""
+    return bool(post.get("post_to_x", 1))
 SECONDS_4_HOURS = 4 * 60 * 60
 SECONDS_24_HOURS = 24 * 60 * 60
 
@@ -102,7 +107,7 @@ class SchedulerCog(commands.Cog):
 
             # Post to X (runs in executor since tweepy is synchronous)
             tweet_url = None
-            if X_ENABLED:
+            if X_ENABLED and _post_to_x(post):
                 loop = asyncio.get_running_loop()
                 tweet_url = await loop.run_in_executor(
                     None, post_tweet, post["content"], post.get("image_path")
@@ -133,32 +138,49 @@ class SchedulerCog(commands.Cog):
                     f"Originally scheduled for: <t:{post['scheduled_at']}:F>\n"
                     f"Scheduled by: <@{post['created_by']}>"
                 )
-                if tweet_url:
-                    archive_text += f"\n\n{tweet_url}"
+                if _post_to_x(post):
+                    if tweet_url:
+                        archive_text += f"\n\n{tweet_url}"
+                else:
+                    archive_text += "\n\n*(Manual X — not auto-posted by the bot; no tweet link here.)*"
                 file = _get_discord_file(post.get("image_path"))
                 no_pings = discord.AllowedMentions.none()
                 await archive_channel.send(archive_text, file=file, allowed_mentions=no_pings)
 
             if reminders_channel and claimers:
                 mentions = " ".join(f"<@{uid}>" for uid in claimers)
-                reminder_text = (
-                    f"Your post just went live! Time to share the link and engage with replies.\n\n"
-                    f"{_quote_content(post['content'])}\n\n"
-                )
-                if tweet_url:
-                    reminder_text += f"{tweet_url}\n\n"
+                if _post_to_x(post):
+                    reminder_text = (
+                        f"Your post just went live! Time to share the link and engage with replies.\n\n"
+                        f"{_quote_content(post['content'])}\n\n"
+                    )
+                    if tweet_url:
+                        reminder_text += f"{tweet_url}\n\n"
+                else:
+                    reminder_text = (
+                        "**Your slot is live** — the bot did **not** post this to X. "
+                        "Open X, publish it yourself, then share and engage.\n\n"
+                        f"{_quote_content(post['content'])}\n\n"
+                    )
                 reminder_text += mentions
                 await reminders_channel.send(reminder_text)
             elif reminders_channel and not post.get("skip_unclaimed_pings"):
                 available = await get_available_active_user_ids(post["id"])
                 if available:
                     mentions = " ".join(f"<@{uid}>" for uid in available)
-                    reminder_text = (
-                        f"A post just went live but **nobody claimed it**! Someone needs to share the link and engage.\n\n"
-                        f"{_quote_content(post['content'])}\n\n"
-                    )
-                    if tweet_url:
-                        reminder_text += f"{tweet_url}\n\n"
+                    if _post_to_x(post):
+                        reminder_text = (
+                            f"A post just went live but **nobody claimed it**! Someone needs to share the link and engage.\n\n"
+                            f"{_quote_content(post['content'])}\n\n"
+                        )
+                        if tweet_url:
+                            reminder_text += f"{tweet_url}\n\n"
+                    else:
+                        reminder_text = (
+                            "A **manual X** slot just went live but **nobody claimed it**! "
+                            "Someone needs to handle it on X.\n\n"
+                            f"{_quote_content(post['content'])}\n\n"
+                        )
                     reminder_text += mentions
                     await reminders_channel.send(reminder_text)
 
@@ -181,10 +203,17 @@ class SchedulerCog(commands.Cog):
             claimers = await get_claimers_for_post(post["id"])
             if claimers:
                 mentions = " ".join(f"<@{uid}>" for uid in claimers)
+                if _post_to_x(post):
+                    pre_body = (
+                        f"Your post goes live <t:{post['scheduled_at']}:R> — get ready to engage!\n\n"
+                    )
+                else:
+                    pre_body = (
+                        f"Your slot goes live <t:{post['scheduled_at']}:R> — **you** post it on X "
+                        f"(the bot will not). Get ready to publish and engage.\n\n"
+                    )
                 await reminders_channel.send(
-                    f"Your post goes live <t:{post['scheduled_at']}:R> — get ready to engage!\n\n"
-                    f"{_quote_content(post['content'])}\n\n"
-                    f"{mentions}"
+                    f"{pre_body}{_quote_content(post['content'])}\n\n{mentions}"
                 )
             elif not post.get("skip_unclaimed_pings"):
                 available = await get_available_active_user_ids(post["id"])

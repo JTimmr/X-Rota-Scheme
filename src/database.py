@@ -61,6 +61,11 @@ async def init_db():
         if "tweet_url" not in columns:
             await db.execute("ALTER TABLE posts ADD COLUMN tweet_url TEXT")
             await db.commit()
+        if "skip_unclaimed_pings" not in columns:
+            await db.execute(
+                "ALTER TABLE posts ADD COLUMN skip_unclaimed_pings INTEGER NOT NULL DEFAULT 0"
+            )
+            await db.commit()
 
 
 async def insert_post(discord_message_id: str, content: str, scheduled_at: int, created_by: str, image_path: str | None = None) -> int:
@@ -152,6 +157,15 @@ async def update_post_image(post_id: int, image_path: str | None):
 async def update_post_tweet_url(post_id: int, tweet_url: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE posts SET tweet_url = ? WHERE id = ?", (tweet_url, post_id))
+        await db.commit()
+
+
+async def update_post_skip_unclaimed_pings(post_id: int, skip: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE posts SET skip_unclaimed_pings = ? WHERE id = ?",
+            (1 if skip else 0, post_id),
+        )
         await db.commit()
 
 

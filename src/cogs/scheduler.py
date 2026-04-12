@@ -149,7 +149,7 @@ class SchedulerCog(commands.Cog):
                     reminder_text += f"{tweet_url}\n\n"
                 reminder_text += mentions
                 await reminders_channel.send(reminder_text)
-            elif reminders_channel:
+            elif reminders_channel and not post.get("skip_unclaimed_pings"):
                 available = await get_available_active_user_ids(post["id"])
                 if available:
                     mentions = " ".join(f"<@{uid}>" for uid in available)
@@ -186,7 +186,7 @@ class SchedulerCog(commands.Cog):
                     f"{_quote_content(post['content'])}\n\n"
                     f"{mentions}"
                 )
-            else:
+            elif not post.get("skip_unclaimed_pings"):
                 available = await get_available_active_user_ids(post["id"])
                 if available:
                     mentions = " ".join(f"<@{uid}>" for uid in available)
@@ -209,6 +209,10 @@ class SchedulerCog(commands.Cog):
 
         for post in unassigned:
             if post["id"] in self._reminded_unassigned:
+                continue
+
+            if post.get("skip_unclaimed_pings"):
+                self._reminded_unassigned.add(post["id"])
                 continue
 
             available = await get_available_active_user_ids(post["id"])

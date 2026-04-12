@@ -26,6 +26,7 @@ from database import (
     update_post_image,
     update_post_message_id,
     update_post_scheduled_at,
+    update_post_skip_unclaimed_pings,
 )
 
 log = logging.getLogger("rota-bot.schedule")
@@ -57,6 +58,7 @@ def format_scheduled_message(
     created_by_id: str,
     claimers: list[str] | None = None,
     unavailable: list[str] | None = None,
+    skip_unclaimed_pings: bool = False,
 ) -> str:
     lines = [
         "**Scheduled Post**",
@@ -70,6 +72,10 @@ def format_scheduled_message(
     if claimers:
         mentions = ", ".join(f"<@{uid}>" for uid in claimers)
         lines.append(f"Claimed by: {mentions}")
+    elif skip_unclaimed_pings:
+        lines.append(
+            "**Unclaimed** — claiming is optional; the team will **not** be pinged while this stays unclaimed."
+        )
     else:
         lines.append("**Unclaimed** — click Claim to take this post!")
 
@@ -298,7 +304,7 @@ class EditMediaView(discord.ui.View):
 class PostButtonView(discord.ui.View):
     """Buttons attached to each scheduled post message."""
 
-    def __init__(self, bot: commands.Bot, post_id: int):
+    def __init__(self, bot: commands.Bot, post_id: int, skip_unclaimed_pings: bool = False):
         super().__init__(timeout=None)
         self.bot = bot
         self.post_id = post_id
@@ -338,6 +344,23 @@ class PostButtonView(discord.ui.View):
         edit_media_btn.callback = self._on_edit_media
         self.add_item(edit_media_btn)
 
+        if skip_unclaimed_pings:
+            ping_btn = discord.ui.Button(
+                label="Ping team if unclaimed",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"skippings:{post_id}",
+                row=2,
+            )
+        else:
+            ping_btn = discord.ui.Button(
+                label="No team ping if unclaimed",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"skippings:{post_id}",
+                row=2,
+            )
+        ping_btn.callback = self._on_toggle_skip_unclaimed_pings
+        self.add_item(ping_btn)
+
     async def _on_claim(self, interaction: discord.Interaction):
         uid = str(interaction.user.id)
         claimers = await get_claimers_for_post(self.post_id)
@@ -347,6 +370,16 @@ class PostButtonView(discord.ui.View):
         else:
             await add_claim(self.post_id, uid)
             log.info(f"User {uid} claimed post {self.post_id}")
+        await self._update_message(interaction)
+
+    async def _on_toggle_skip_unclaimed_pings(self, interaction: discord.Interaction):
+        post = await get_post_by_id(self.post_id)
+        if not post:
+            await interaction.response.send_message("This post no longer exists.", ephemeral=True)
+            return
+        new_val = not bool(post.get("skip_unclaimed_pings"))
+        await update_post_skip_unclaimed_pings(self.post_id, new_val)
+        log.info(f"Post {self.post_id} skip_unclaimed_pings={new_val} (by {interaction.user.id})")
         await self._update_message(interaction)
 
     async def _on_unavailable(self, interaction: discord.Interaction):
@@ -403,11 +436,18 @@ class PostButtonView(discord.ui.View):
 
         claimers = await get_claimers_for_post(self.post_id)
         unavailable = await get_unavailable_for_post(self.post_id)
+        skip_pings = bool(post.get("skip_unclaimed_pings"))
 
         new_content = format_scheduled_message(
-            post["content"], post["scheduled_at"], post["created_by"], claimers, unavailable
+            post["content"],
+            post["scheduled_at"],
+            post["created_by"],
+            claimers,
+            unavailable,
+            skip_unclaimed_pings=skip_pings,
         )
-        await interaction.response.edit_message(content=new_content)
+        new_view = PostButtonView(self.bot, self.post_id, skip_unclaimed_pings=skip_pings)
+        await interaction.response.edit_message(content=new_content, view=new_view)
 
 
 # ---------------------------------------------------------------------------
@@ -439,10 +479,16 @@ async def repost_all_scheduled(bot: commands.Bot):
     for post in posts:
         claimers = await get_claimers_for_post(post["id"])
         unavailable = await get_unavailable_for_post(post["id"])
+        skip_pings = bool(post.get("skip_unclaimed_pings"))
         content = format_scheduled_message(
-            post["content"], post["scheduled_at"], post["created_by"], claimers, unavailable
+            post["content"],
+            post["scheduled_at"],
+            post["created_by"],
+            claimers,
+            unavailable,
+            skip_unclaimed_pings=skip_pings,
         )
-        view = PostButtonView(bot, post["id"])
+        view = PostButtonView(bot, post["id"], skip_unclaimed_pings=skip_pings)
         file = get_discord_file(post.get("image_path"))
         no_pings = discord.AllowedMentions.none()
         msg = await channel.send(content, view=view, file=file, allowed_mentions=no_pings)

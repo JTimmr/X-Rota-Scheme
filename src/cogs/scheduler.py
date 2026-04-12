@@ -7,7 +7,14 @@ from pathlib import Path
 import discord
 from discord.ext import commands, tasks
 
-from config import ARCHIVE_CHANNEL_ID, GUILD_ID, REMINDERS_CHANNEL_ID, SCHEDULED_CHANNEL_ID, X_ENABLED
+from config import (
+    ARCHIVE_CHANNEL_ID,
+    GUILD_ID,
+    REMINDERS_CHANNEL_ID,
+    SCHEDULED_CHANNEL_ID,
+    X_ENABLED,
+    X_LIVE_POST_LINK_CHANNEL_IDS,
+)
 from database import (
     get_active_user_ids,
     get_available_active_user_ids,
@@ -102,6 +109,19 @@ class SchedulerCog(commands.Cog):
                 )
                 if tweet_url:
                     await update_post_tweet_url(post["id"], tweet_url)
+
+            if tweet_url and X_LIVE_POST_LINK_CHANNEL_IDS:
+                for link_channel_id in X_LIVE_POST_LINK_CHANNEL_IDS:
+                    link_channel = self.bot.get_channel(link_channel_id)
+                    if not link_channel:
+                        log.warning(f"X live link channel {link_channel_id} not found")
+                        continue
+                    try:
+                        await link_channel.send(tweet_url)
+                    except discord.Forbidden:
+                        log.warning(f"No permission to send X link in channel {link_channel_id}")
+                    except discord.HTTPException:
+                        log.exception(f"Failed to send X link to channel {link_channel_id}")
 
             if archive_channel:
                 live_ts = int(time.time())

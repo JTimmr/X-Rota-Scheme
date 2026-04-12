@@ -3,3 +3,8 @@ DISCORD_GUILD_ID=your_guild_id_here
 SCHEDULED_CHANNEL_ID=channel_id_for_scheduled_posts
 ARCHIVE_CHANNEL_ID=channel_id_for_historical_posts
 REMINDERS_CHANNEL_ID=channel_id_for_reminders
+
+# When a tweet goes live, the bot sends the x.com post URL to each channel you set (optional; leave blank to skip)
+X_LIVE_POST_LINK_CHANNEL_ID_1=
+X_LIVE_POST_LINK_CHANNEL_ID_2=
+

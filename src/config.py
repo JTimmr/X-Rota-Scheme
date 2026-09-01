@@ -1,11 +1,29 @@
+import logging
 import os
+
+
+log = logging.getLogger("rota-bot.config")
 
 
 def _optional_int_env(name: str) -> int | None:
     value = os.environ.get(name)
     if value is None or not str(value).strip():
         return None
-    return int(str(value).strip())
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        fallback = (
+            "active-user alerts"
+            if name == "ROTA_ALERT_ROLE_ID"
+            else "default behavior"
+        )
+        log.warning(
+            "Invalid %s=%r; expected an integer. Ignoring it and using %s.",
+            name,
+            value,
+            fallback,
+        )
+        return None
 
 
 def require_env(name: str) -> str:
@@ -20,6 +38,9 @@ GUILD_ID = int(require_env("DISCORD_GUILD_ID"))
 SCHEDULED_CHANNEL_ID = int(require_env("SCHEDULED_CHANNEL_ID"))
 ARCHIVE_CHANNEL_ID = int(require_env("ARCHIVE_CHANNEL_ID"))
 REMINDERS_CHANNEL_ID = int(require_env("REMINDERS_CHANNEL_ID"))
+
+# Optional role used for team-wide rota alerts; falls back to active users
+ROTA_ALERT_ROLE_ID = _optional_int_env("ROTA_ALERT_ROLE_ID")
 
 # X/Twitter API credentials (optional — if not set, X posting is disabled)
 X_API_KEY = os.environ.get("X_API_KEY")

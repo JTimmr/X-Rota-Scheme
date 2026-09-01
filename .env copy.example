@@ -4,7 +4,16 @@ SCHEDULED_CHANNEL_ID=channel_id_for_scheduled_posts
 ARCHIVE_CHANNEL_ID=channel_id_for_historical_posts
 REMINDERS_CHANNEL_ID=channel_id_for_reminders
 
+# Optional: role to mention for required-unclaimed and daily rota alerts (falls back to active users)
+ROTA_ALERT_ROLE_ID=
+
+# X API credentials (optional; all four are required for automatic posting)
+X_API_KEY=
+X_API_SECRET=
+X_ACCESS_TOKEN=
+X_ACCESS_TOKEN_SECRET=
+
 # When a tweet goes live, the bot sends the x.com post URL to each channel you set (optional; leave blank to skip)
-X_LIVE_POST_LINK_CHANNEL_ID_1=
-X_LIVE_POST_LINK_CHANNEL_ID_2=
+X_LIVE_POST_LINK_CHANNEL_ID_1=1346931977068089349
+X_LIVE_POST_LINK_CHANNEL_ID_2=1346931977068089354
 

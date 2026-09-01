@@ -7,10 +7,16 @@ from pathlib import Path
 import discord
 from discord.ext import commands, tasks
 
+from cogs.schedule import (
+    DISCORD_CONTENT_LIMIT,
+    build_post_embed,
+    get_schedule_refresh_lock,
+)
 from config import (
     ARCHIVE_CHANNEL_ID,
     GUILD_ID,
     REMINDERS_CHANNEL_ID,
+    ROTA_ALERT_ROLE_ID,
     SCHEDULED_CHANNEL_ID,
     X_ENABLED,
     X_LIVE_POST_LINK_CHANNEL_IDS,
@@ -20,45 +26,99 @@ from database import (
     get_available_active_user_ids,
     get_claimers_for_post,
     get_due_posts,
+    get_post_by_id,
     get_posts_without_claims_in_range,
     get_scheduled_posts_in_range,
-    mark_post_live,
-    update_post_message_id,
+    record_post_alert_delivery,
+    transition_due_post_to_live,
     update_post_tweet_url,
+    was_post_alert_delivered,
 )
-from x_client import post_tweet
+from x_client import (
+    X_POST_FAILED,
+    X_POST_SUCCESS,
+    X_POST_UNKNOWN,
+    XPostResult,
+    post_tweet_result,
+)
 
 
-def _get_discord_file(image_path: str | None) -> discord.File | None:
-    if not image_path:
+def _get_discord_file(media_path: str | None) -> discord.File | None:
+    if not media_path:
         return None
-    p = Path(image_path)
+    p = Path(media_path)
     if p.exists():
         return discord.File(p, filename=p.name)
     return None
 
 
-def _quote_content(content: str) -> str:
-    return "\n".join(f"> {line}" for line in content.split("\n"))
+def _user_alert_target(user_ids: list[str]) -> tuple[str, discord.AllowedMentions]:
+    mentions = " ".join(f"<@{uid}>" for uid in user_ids)
+    allowed_mentions = discord.AllowedMentions(
+        everyone=False,
+        users=[discord.Object(id=int(uid)) for uid in user_ids],
+        roles=False,
+        replied_user=False,
+    )
+    return mentions, allowed_mentions
+
+
+MAX_ALLOWED_USER_MENTIONS = 100
+
+
+def _user_alert_batches(
+    body: str,
+    user_ids: list[str],
+) -> list[tuple[str, discord.AllowedMentions]]:
+    """Batch user mentions within Discord content and allowed-mention limits."""
+    if len(body) > DISCORD_CONTENT_LIMIT:
+        raise ValueError("notification body exceeds Discord's content limit")
+
+    ordered = list(dict.fromkeys(str(user_id) for user_id in user_ids))
+    batches: list[list[str]] = []
+    current: list[str] = []
+    for user_id in ordered:
+        candidate = current + [user_id]
+        mention_text = " ".join(f"<@{uid}>" for uid in candidate)
+        content_length = len(body) + (2 if body else 0) + len(mention_text)
+        if current and (
+            len(candidate) > MAX_ALLOWED_USER_MENTIONS
+            or content_length > DISCORD_CONTENT_LIMIT
+        ):
+            batches.append(current)
+            current = [user_id]
+        else:
+            current = candidate
+    if current:
+        batches.append(current)
+
+    results = []
+    for batch in batches:
+        mentions, allowed_mentions = _user_alert_target(batch)
+        content = f"{body}\n\n{mentions}" if body else mentions
+        results.append((content, allowed_mentions))
+    return results
+
 
 log = logging.getLogger("rota-bot.scheduler")
 
 SECONDS_15_MIN = 15 * 60
+SECONDS_4_HOURS = 4 * 60 * 60
+SECONDS_24_HOURS = 24 * 60 * 60
+ALERT_KIND_FOUR_HOUR = "unclaimed_4h"
+ALERT_KIND_FIFTEEN_MINUTE = "pre_live_15m"
 
 
 def _post_to_x(post: dict) -> bool:
     """If False, bot does not tweet or broadcast tweet URLs; claimer handles X manually."""
     return bool(post.get("post_to_x", 1))
-SECONDS_4_HOURS = 4 * 60 * 60
-SECONDS_24_HOURS = 24 * 60 * 60
 
 
 class SchedulerCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._last_gap_check_date: str | None = None
-        self._reminded_pre_post: set[int] = set()
-        self._reminded_unassigned: set[int] = set()
+        self._alert_role_warning_logged = False
 
     async def cog_load(self):
         self.tick.start()
@@ -70,8 +130,9 @@ class SchedulerCog(commands.Cog):
     async def tick(self):
         try:
             await self._check_go_live()
-            await self._check_pre_post_reminders()
-            await self._check_unassigned_posts()
+            reminder_now = int(time.time())
+            await self._check_pre_post_reminders(reminder_now)
+            await self._check_unassigned_posts(reminder_now)
             await self._check_daily_gap()
         except Exception:
             log.exception("Error in scheduler tick")
@@ -79,6 +140,153 @@ class SchedulerCog(commands.Cog):
     @tick.before_loop
     async def before_tick(self):
         await self.bot.wait_until_ready()
+
+    def _get_alert_role(self) -> discord.Role | None:
+        if ROTA_ALERT_ROLE_ID is None:
+            return None
+
+        guild = self.bot.get_guild(GUILD_ID)
+        role = guild.get_role(ROTA_ALERT_ROLE_ID) if guild else None
+        if role:
+            self._alert_role_warning_logged = False
+            return role
+
+        if not self._alert_role_warning_logged:
+            log.warning(
+                "ROTA_ALERT_ROLE_ID=%s does not resolve to a role in configured guild %s; "
+                "falling back to active-user alerts",
+                ROTA_ALERT_ROLE_ID,
+                GUILD_ID,
+            )
+            self._alert_role_warning_logged = True
+        return None
+
+    async def _team_alert_target(
+        self, post_id: int | None = None
+    ) -> tuple[str, discord.AllowedMentions] | None:
+        role = self._get_alert_role()
+        if role:
+            return role.mention, discord.AllowedMentions(
+                everyone=False,
+                users=False,
+                roles=[role],
+                replied_user=False,
+            )
+
+        user_ids = (
+            await get_available_active_user_ids(post_id)
+            if post_id is not None
+            else await get_active_user_ids()
+        )
+        return _user_alert_target(user_ids) if user_ids else None
+
+    async def _send_user_notifications(
+        self,
+        channel,
+        body: str,
+        user_ids: list[str],
+        *,
+        embed: discord.Embed | None = None,
+    ) -> bool:
+        batches = _user_alert_batches(body, user_ids)
+        if not batches:
+            return False
+        for content, allowed_mentions in batches:
+            send_kwargs = {"allowed_mentions": allowed_mentions}
+            if embed is not None:
+                send_kwargs["embed"] = embed
+            await channel.send(content, **send_kwargs)
+        return True
+
+    async def _send_team_notification(
+        self,
+        channel,
+        body: str,
+        post_id: int | None = None,
+        *,
+        embed: discord.Embed | None = None,
+    ) -> bool:
+        role = self._get_alert_role()
+        if role:
+            content = f"{body}\n\n{role.mention}"
+            if len(content) > DISCORD_CONTENT_LIMIT:
+                raise ValueError("role notification exceeds Discord's content limit")
+            send_kwargs = {
+                "allowed_mentions": discord.AllowedMentions(
+                    everyone=False,
+                    users=False,
+                    roles=[role],
+                    replied_user=False,
+                )
+            }
+            if embed is not None:
+                send_kwargs["embed"] = embed
+            await channel.send(content, **send_kwargs)
+            return True
+
+        user_ids = (
+            await get_available_active_user_ids(post_id)
+            if post_id is not None
+            else await get_active_user_ids()
+        )
+        return await self._send_user_notifications(
+            channel,
+            body,
+            user_ids,
+            embed=embed,
+        )
+
+    async def _take_due_post(self, post_id: int, schedule_channel) -> dict | None:
+        """Transition and remove the current schedule message under refresh lock."""
+        async with get_schedule_refresh_lock(self.bot):
+            post = await get_post_by_id(post_id)
+            now = int(time.time())
+            if (
+                not post
+                or post.get("status") != "scheduled"
+                or post["scheduled_at"] > now
+            ):
+                return None
+
+            message_id = str(post["discord_message_id"])
+            transitioned = await transition_due_post_to_live(
+                post_id,
+                message_id,
+                f"live_{post_id}",
+                now,
+            )
+            if not transitioned:
+                return None
+
+            if schedule_channel:
+                try:
+                    message = await schedule_channel.fetch_message(int(message_id))
+                    await message.delete()
+                except (discord.NotFound, ValueError):
+                    pass
+                except discord.Forbidden:
+                    log.warning("No permission to delete message %s", message_id)
+                except discord.HTTPException:
+                    log.exception("Failed to delete live schedule message %s", message_id)
+            return post
+
+    @staticmethod
+    def _x_outcome_body(result: XPostResult) -> str:
+        if result.status == X_POST_SUCCESS:
+            return (
+                "Your post just went live! Time to share the link and engage "
+                f"with replies.\n\n{result.url}"
+            )
+        if result.status == X_POST_UNKNOWN:
+            return (
+                "**X posting outcome is unknown.** Check the X account before "
+                "retrying; do not immediately republish because X may have "
+                "accepted the request."
+            )
+        return (
+            "**X auto-post failed.** No X post was created. The bot will not "
+            "retry automatically; publish it manually."
+        )
 
     async def _check_go_live(self):
         due_posts = await get_due_posts()
@@ -89,107 +297,152 @@ class SchedulerCog(commands.Cog):
         archive_channel = self.bot.get_channel(ARCHIVE_CHANNEL_ID)
         reminders_channel = self.bot.get_channel(REMINDERS_CHANNEL_ID)
 
-        for post in due_posts:
-            await mark_post_live(post["id"])
+        for candidate in due_posts:
+            post = await self._take_due_post(candidate["id"], schedule_channel)
+            if post is None:
+                continue
             claimers = await get_claimers_for_post(post["id"])
 
-            # Invalidate message ID so the delete event doesn't remove the post
-            await update_post_message_id(post["id"], f"live_{post['id']}")
+            x_result: XPostResult | None = None
+            if _post_to_x(post):
+                if X_ENABLED:
+                    loop = asyncio.get_running_loop()
+                    x_result = await loop.run_in_executor(
+                        None,
+                        post_tweet_result,
+                        post["content"],
+                        post.get("image_path"),
+                    )
+                else:
+                    x_result = XPostResult(
+                        X_POST_FAILED,
+                        detail="X credentials are disabled",
+                    )
 
-            if schedule_channel:
-                try:
-                    msg = await schedule_channel.fetch_message(int(post["discord_message_id"]))
-                    await msg.delete()
-                except (discord.NotFound, ValueError):
-                    pass
-                except discord.Forbidden:
-                    log.warning(f"No permission to delete message {post['discord_message_id']}")
+                if x_result.status == X_POST_SUCCESS and x_result.url:
+                    await update_post_tweet_url(post["id"], x_result.url)
+                elif x_result.status == X_POST_UNKNOWN:
+                    log.error(
+                        "X outcome is unknown for post %s; check X before retrying",
+                        post["id"],
+                    )
+                else:
+                    log.error(
+                        "X auto-post failed for post %s before tweet creation: %s",
+                        post["id"],
+                        x_result.detail or "unspecified confirmed failure",
+                    )
 
-            # Post to X (runs in executor since tweepy is synchronous)
-            tweet_url = None
-            if X_ENABLED and _post_to_x(post):
-                loop = asyncio.get_running_loop()
-                tweet_url = await loop.run_in_executor(
-                    None, post_tweet, post["content"], post.get("image_path")
-                )
-                if tweet_url:
-                    await update_post_tweet_url(post["id"], tweet_url)
-
-            if tweet_url and X_LIVE_POST_LINK_CHANNEL_IDS:
+            if (
+                x_result
+                and x_result.status == X_POST_SUCCESS
+                and x_result.url
+                and X_LIVE_POST_LINK_CHANNEL_IDS
+            ):
                 for link_channel_id in X_LIVE_POST_LINK_CHANNEL_IDS:
                     link_channel = self.bot.get_channel(link_channel_id)
                     if not link_channel:
-                        log.warning(f"X live link channel {link_channel_id} not found")
+                        log.warning("X live link channel %s not found", link_channel_id)
                         continue
                     try:
-                        await link_channel.send(tweet_url)
+                        await link_channel.send(
+                            x_result.url,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
                     except discord.Forbidden:
-                        log.warning(f"No permission to send X link in channel {link_channel_id}")
+                        log.warning(
+                            "No permission to send X link in channel %s",
+                            link_channel_id,
+                        )
                     except discord.HTTPException:
-                        log.exception(f"Failed to send X link to channel {link_channel_id}")
+                        log.exception(
+                            "Failed to send X link to channel %s",
+                            link_channel_id,
+                        )
 
             if archive_channel:
                 live_ts = int(time.time())
+                if not _post_to_x(post):
+                    archive_heading = (
+                        f"**Manual X slot went live** <t:{live_ts}:F>\n"
+                        "The bot did not post this to X."
+                    )
+                elif x_result and x_result.status == X_POST_SUCCESS:
+                    archive_heading = f"**Post went live on X** <t:{live_ts}:F>"
+                elif x_result and x_result.status == X_POST_UNKNOWN:
+                    archive_heading = (
+                        f"**X posting outcome unknown** <t:{live_ts}:F>\n"
+                        "Check X before retrying; the request may have succeeded."
+                    )
+                else:
+                    archive_heading = (
+                        f"**X auto-post failed** <t:{live_ts}:F>\n"
+                        "No X post was created; publish this manually."
+                    )
                 archive_text = (
-                    f"**Post went live** <t:{live_ts}:F>\n"
-                    f"\n"
-                    f"{_quote_content(post['content'])}\n"
-                    f"\n"
+                    f"{archive_heading}\n\n"
                     f"Originally scheduled for: <t:{post['scheduled_at']}:F>\n"
                     f"Scheduled by: <@{post['created_by']}>"
                 )
-                if _post_to_x(post):
-                    if tweet_url:
-                        archive_text += f"\n\n{tweet_url}"
-                else:
-                    archive_text += "\n\n*(Manual X — not auto-posted by the bot; no tweet link here.)*"
+                if x_result and x_result.status == X_POST_SUCCESS and x_result.url:
+                    archive_text += f"\n\n{x_result.url}"
                 file = _get_discord_file(post.get("image_path"))
-                no_pings = discord.AllowedMentions.none()
-                await archive_channel.send(archive_text, file=file, allowed_mentions=no_pings)
+                send_kwargs = {
+                    "embed": build_post_embed(post["content"]),
+                    "allowed_mentions": discord.AllowedMentions.none(),
+                }
+                if file is not None:
+                    send_kwargs["file"] = file
+                await archive_channel.send(archive_text, **send_kwargs)
 
+            notification_sent = False
             if reminders_channel and claimers:
-                mentions = " ".join(f"<@{uid}>" for uid in claimers)
                 if _post_to_x(post):
-                    reminder_text = (
-                        f"Your post just went live! Time to share the link and engage with replies.\n\n"
-                        f"{_quote_content(post['content'])}\n\n"
-                    )
-                    if tweet_url:
-                        reminder_text += f"{tweet_url}\n\n"
+                    reminder_body = self._x_outcome_body(x_result)
                 else:
-                    reminder_text = (
-                        "**Your slot is live** — the bot did **not** post this to X. "
-                        "Open X, publish it yourself, then share and engage.\n\n"
-                        f"{_quote_content(post['content'])}\n\n"
+                    reminder_body = (
+                        "**Your manual-X slot is live.** Open X, publish it "
+                        "yourself, then share and engage."
                     )
-                reminder_text += mentions
-                await reminders_channel.send(reminder_text)
+                notification_sent = await self._send_user_notifications(
+                    reminders_channel,
+                    reminder_body,
+                    claimers,
+                    embed=build_post_embed(post["content"]),
+                )
             elif reminders_channel and not post.get("skip_unclaimed_pings"):
-                available = await get_available_active_user_ids(post["id"])
-                if available:
-                    mentions = " ".join(f"<@{uid}>" for uid in available)
-                    if _post_to_x(post):
-                        reminder_text = (
-                            f"A post just went live but **nobody claimed it**! Someone needs to share the link and engage.\n\n"
-                            f"{_quote_content(post['content'])}\n\n"
-                        )
-                        if tweet_url:
-                            reminder_text += f"{tweet_url}\n\n"
-                    else:
-                        reminder_text = (
-                            "A **manual X** slot just went live but **nobody claimed it**! "
-                            "Someone needs to handle it on X.\n\n"
-                            f"{_quote_content(post['content'])}\n\n"
-                        )
-                    reminder_text += mentions
-                    await reminders_channel.send(reminder_text)
+                if _post_to_x(post):
+                    reminder_body = self._x_outcome_body(x_result)
+                else:
+                    reminder_body = (
+                        "A **manual-X slot is live but unclaimed**. Someone "
+                        "needs to publish it on X."
+                    )
+                notification_sent = await self._send_team_notification(
+                    reminders_channel,
+                    reminder_body,
+                    post["id"],
+                    embed=build_post_embed(post["content"]),
+                )
 
-            self._reminded_pre_post.discard(post["id"])
-            self._reminded_unassigned.discard(post["id"])
-            log.info(f"Post {post['id']} went live and moved to archive")
+            if (
+                reminders_channel
+                and _post_to_x(post)
+                and x_result
+                and x_result.status != X_POST_SUCCESS
+                and not notification_sent
+            ):
+                await reminders_channel.send(
+                    self._x_outcome_body(x_result),
+                    embed=build_post_embed(post["content"]),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
 
-    async def _check_pre_post_reminders(self):
-        now = int(time.time())
+            log.info("Post %s completed go-live processing", post["id"])
+
+    async def _check_pre_post_reminders(self, now: int | None = None):
+        if now is None:
+            now = int(time.time())
         upcoming = await get_scheduled_posts_in_range(now, now + SECONDS_15_MIN)
 
         reminders_channel = self.bot.get_channel(REMINDERS_CHANNEL_ID)
@@ -197,64 +450,88 @@ class SchedulerCog(commands.Cog):
             return
 
         for post in upcoming:
-            if post["id"] in self._reminded_pre_post:
+            if await was_post_alert_delivered(
+                post["id"],
+                ALERT_KIND_FIFTEEN_MINUTE,
+            ):
                 continue
 
             claimers = await get_claimers_for_post(post["id"])
+            notified = False
             if claimers:
-                mentions = " ".join(f"<@{uid}>" for uid in claimers)
                 if _post_to_x(post):
-                    pre_body = (
+                    reminder_body = (
                         f"Your post goes live <t:{post['scheduled_at']}:R> — get ready to engage!\n\n"
                     )
                 else:
-                    pre_body = (
+                    reminder_body = (
                         f"Your slot goes live <t:{post['scheduled_at']}:R> — **you** post it on X "
                         f"(the bot will not). Get ready to publish and engage.\n\n"
                     )
-                await reminders_channel.send(
-                    f"{pre_body}{_quote_content(post['content'])}\n\n{mentions}"
+                notified = await self._send_user_notifications(
+                    reminders_channel,
+                    reminder_body.rstrip(),
+                    claimers,
+                    embed=build_post_embed(post["content"]),
                 )
             elif not post.get("skip_unclaimed_pings"):
-                available = await get_available_active_user_ids(post["id"])
-                if available:
-                    mentions = " ".join(f"<@{uid}>" for uid in available)
-                    msg_link = f"https://discord.com/channels/{GUILD_ID}/{SCHEDULED_CHANNEL_ID}/{post['discord_message_id']}"
-                    await reminders_channel.send(
-                        f"A post goes live <t:{post['scheduled_at']}:R> and **still nobody has claimed it**!\n\n"
-                        f"{_quote_content(post['content'])}\n\n"
-                        f"[Jump to post]({msg_link}) to claim it.\n\n"
-                        f"{mentions}"
-                    )
-            self._reminded_pre_post.add(post["id"])
+                msg_link = f"https://discord.com/channels/{GUILD_ID}/{SCHEDULED_CHANNEL_ID}/{post['discord_message_id']}"
+                reminder_body = (
+                    f"A post goes live <t:{post['scheduled_at']}:R> and "
+                    "**still nobody has claimed it**!\n\n"
+                    f"[Jump to post]({msg_link}) to claim it."
+                )
+                notified = await self._send_team_notification(
+                    reminders_channel,
+                    reminder_body,
+                    post["id"],
+                    embed=build_post_embed(post["content"]),
+                )
+            if notified:
+                await record_post_alert_delivery(
+                    post["id"],
+                    ALERT_KIND_FIFTEEN_MINUTE,
+                )
 
-    async def _check_unassigned_posts(self):
-        now = int(time.time())
-        unassigned = await get_posts_without_claims_in_range(now, now + SECONDS_4_HOURS)
+    async def _check_unassigned_posts(self, now: int | None = None):
+        if now is None:
+            now = int(time.time())
+        unassigned = await get_posts_without_claims_in_range(
+            now + SECONDS_15_MIN + 1,
+            now + SECONDS_4_HOURS,
+        )
 
         reminders_channel = self.bot.get_channel(REMINDERS_CHANNEL_ID)
         if not reminders_channel:
             return
 
         for post in unassigned:
-            if post["id"] in self._reminded_unassigned:
+            if await was_post_alert_delivered(
+                post["id"],
+                ALERT_KIND_FOUR_HOUR,
+            ):
                 continue
 
             if post.get("skip_unclaimed_pings"):
-                self._reminded_unassigned.add(post["id"])
                 continue
 
-            available = await get_available_active_user_ids(post["id"])
-            if available:
-                mentions = " ".join(f"<@{uid}>" for uid in available)
-                msg_link = f"https://discord.com/channels/{GUILD_ID}/{SCHEDULED_CHANNEL_ID}/{post['discord_message_id']}"
-                await reminders_channel.send(
-                    f"This post goes live <t:{post['scheduled_at']}:R> and **nobody has claimed it**!\n\n"
-                    f"{_quote_content(post['content'])}\n\n"
-                    f"[Jump to post]({msg_link}) to claim it.\n\n"
-                    f"{mentions}"
+            msg_link = f"https://discord.com/channels/{GUILD_ID}/{SCHEDULED_CHANNEL_ID}/{post['discord_message_id']}"
+            reminder_body = (
+                f"This post goes live <t:{post['scheduled_at']}:R> and "
+                "**nobody has claimed it**!\n\n"
+                f"[Jump to post]({msg_link}) to claim it."
+            )
+            notified = await self._send_team_notification(
+                reminders_channel,
+                reminder_body,
+                post["id"],
+                embed=build_post_embed(post["content"]),
+            )
+            if notified:
+                await record_post_alert_delivery(
+                    post["id"],
+                    ALERT_KIND_FOUR_HOUR,
                 )
-            self._reminded_unassigned.add(post["id"])
 
     async def _check_daily_gap(self):
         utc_now = datetime.now(timezone.utc)
@@ -275,24 +552,21 @@ class SchedulerCog(commands.Cog):
         if not reminders_channel:
             return
 
-        active_users = await get_active_user_ids()
-        if not active_users:
-            return
-
-        mentions = " ".join(f"<@{uid}>" for uid in active_users)
         count = len(upcoming)
         if count == 0:
-            await reminders_channel.send(
-                f"**No posts** are scheduled for the next 24 hours! We need at least 2.\n\n"
-                f"Use `/schedule` in <#{SCHEDULED_CHANNEL_ID}> to add posts.\n\n"
-                f"{mentions}"
+            body = (
+                "**No posts** are scheduled for the next 24 hours! We need at "
+                f"least 2.\n\nUse `/schedule` in <#{SCHEDULED_CHANNEL_ID}> "
+                "to add posts."
             )
         else:
-            await reminders_channel.send(
-                f"Only **{count} post** is scheduled for the next 24 hours. We need at least 2.\n\n"
-                f"Use `/schedule` in <#{SCHEDULED_CHANNEL_ID}> to add more.\n\n"
-                f"{mentions}"
+            body = (
+                f"Only **{count} post** is scheduled for the next 24 hours. "
+                f"We need at least 2.\n\nUse `/schedule` in "
+                f"<#{SCHEDULED_CHANNEL_ID}> to add more."
             )
+        if not await self._send_team_notification(reminders_channel, body):
+            return
 
         log.info(f"Gap detection alert: {count} posts in next 24h")
 

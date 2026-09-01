@@ -1,9 +1,11 @@
-import aiosqlite
 import time
 from pathlib import Path
 
+import aiosqlite
+
 DB_PATH = Path("/app/data/rota.db")
 IMAGES_DIR = Path("/app/data/images")
+OPTIONAL_CLAIMING_MIGRATION = "phase_1_optional_claiming_default"
 
 
 async def init_db():
@@ -20,7 +22,10 @@ async def init_db():
                 created_by TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'scheduled',
                 created_at INTEGER NOT NULL,
-                image_path TEXT
+                image_path TEXT,
+                tweet_url TEXT,
+                skip_unclaimed_pings INTEGER NOT NULL DEFAULT 1,
+                post_to_x INTEGER NOT NULL DEFAULT 1
             )
         """)
         await db.execute("""
@@ -41,6 +46,15 @@ async def init_db():
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE,
                 UNIQUE(post_id, user_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS post_alert_deliveries (
+                post_id INTEGER NOT NULL,
+                alert_kind TEXT NOT NULL,
+                delivered_at INTEGER NOT NULL,
+                PRIMARY KEY (post_id, alert_kind),
+                FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE
             )
         """)
         await db.commit()
@@ -72,6 +86,30 @@ async def init_db():
             )
             await db.commit()
 
+        # Phase 1: make all posts scheduled at upgrade time optional exactly once.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            )
+        """)
+        await db.execute(
+            """
+            UPDATE posts
+            SET skip_unclaimed_pings = 1
+            WHERE status = 'scheduled'
+              AND NOT EXISTS (
+                  SELECT 1 FROM schema_migrations WHERE name = ?
+              )
+            """,
+            (OPTIONAL_CLAIMING_MIGRATION,),
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+            (OPTIONAL_CLAIMING_MIGRATION, int(time.time())),
+        )
+        await db.commit()
+
 
 async def insert_post(
     discord_message_id: str,
@@ -83,7 +121,12 @@ async def insert_post(
 ) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "INSERT INTO posts (discord_message_id, content, scheduled_at, created_by, created_at, image_path, post_to_x) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO posts (
+                discord_message_id, content, scheduled_at, created_by, created_at,
+                image_path, post_to_x, skip_unclaimed_pings
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 discord_message_id,
                 content,
@@ -92,6 +135,7 @@ async def insert_post(
                 int(time.time()),
                 image_path,
                 1 if post_to_x else 0,
+                1,
             ),
         )
         await db.commit()
@@ -156,6 +200,34 @@ async def mark_post_live(post_id: int):
         await db.commit()
 
 
+async def transition_due_post_to_live(
+    post_id: int,
+    expected_message_id: str,
+    live_message_id: str,
+    now: int,
+) -> bool:
+    """Atomically claim one still-due scheduled post for go-live processing."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            UPDATE posts
+            SET status = 'live', discord_message_id = ?
+            WHERE id = ?
+              AND discord_message_id = ?
+              AND status = 'scheduled'
+              AND scheduled_at <= ?
+            """,
+            (
+                live_message_id,
+                post_id,
+                str(expected_message_id),
+                now,
+            ),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
 async def update_post_content(post_id: int, content: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE posts SET content = ? WHERE id = ?", (content, post_id))
@@ -203,6 +275,37 @@ async def get_scheduled_posts_in_range(start: int, end: int) -> list[dict]:
             (start, end),
         )
         return [dict(row) async for row in cursor]
+
+
+# --- Persisted alert delivery dedupe ---
+
+async def was_post_alert_delivered(post_id: int, alert_kind: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT 1
+            FROM post_alert_deliveries
+            WHERE post_id = ? AND alert_kind = ?
+            """,
+            (post_id, alert_kind),
+        )
+        return await cursor.fetchone() is not None
+
+
+async def record_post_alert_delivery(post_id: int, alert_kind: str) -> bool:
+    """Record successful delivery once; False means another writer won."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA foreign_keys = ON")
+        cursor = await db.execute(
+            """
+            INSERT OR IGNORE INTO post_alert_deliveries (
+                post_id, alert_kind, delivered_at
+            ) VALUES (?, ?, ?)
+            """,
+            (post_id, alert_kind, int(time.time())),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
 
 
 # --- Claims (assigned to) ---

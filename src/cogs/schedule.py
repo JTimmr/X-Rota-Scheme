@@ -1,6 +1,8 @@
+import asyncio
 import logging
+import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -8,6 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import media as media_utils
 from config import SCHEDULED_CHANNEL_ID
 from database import (
     IMAGES_DIR,
@@ -32,6 +35,42 @@ from database import (
 log = logging.getLogger("rota-bot.schedule")
 
 DEFAULT_TZ = "Europe/London"
+SCHEDULE_PANEL_CUSTOM_ID = "rota:schedule-post:v1"
+SCHEDULE_PANEL_TEXT = (
+    "**Schedule a post**\n"
+    "Use the button below to write a post, optionally attach one media file, "
+    "and choose when it should go live.\n"
+    "JPG/PNG/WebP, GIF, and MP4 are supported. Videos must be MP4/H.264 and "
+    "no longer than 140 seconds; GIF/video limits are checked before scheduling."
+)
+STARTUP_REFRESH_RETRY_SECONDS = 5
+X_STANDARD_POST_CODEPOINTS = 280
+DISCORD_CONTENT_LIMIT = 2_000
+DISCORD_EMBED_DESCRIPTION_LIMIT = 4_096
+SCHEDULE_MEMBER_DISPLAY_LIMIT = 20
+MEDIA_PICKER_PAGE_SIZE = 25
+
+# Compatibility names retained for integrations/tests built against the
+# image-only phase. They now validate every supported media type.
+SUPPORTED_IMAGE_ERROR = media_utils.SUPPORTED_MEDIA_ERROR
+IMAGE_MISMATCH_ERROR = media_utils.MEDIA_MISMATCH_ERROR
+IMAGE_SAVE_ERROR = media_utils.MEDIA_SAVE_ERROR
+ImageValidationError = media_utils.MediaValidationError
+IMAGE_EXTENSIONS = {
+    extension: media_format
+    for extension, media_format in media_utils.MEDIA_EXTENSIONS.items()
+    if media_format in media_utils.IMAGE_FORMATS
+}
+IMAGE_CONTENT_TYPES = {
+    content_type: media_format
+    for content_type, media_format in media_utils.MEDIA_CONTENT_TYPES.items()
+    if media_format in media_utils.IMAGE_FORMATS
+}
+NORMALIZED_IMAGE_EXTENSIONS = {
+    media_format: extension
+    for media_format, extension in media_utils.NORMALIZED_MEDIA_EXTENSIONS.items()
+    if media_format in media_utils.IMAGE_FORMATS
+}
 
 TIMEZONE_CHOICES = [
     ("UK — Europe/London", "Europe/London"),
@@ -47,9 +86,480 @@ TIMEZONE_CHOICES = [
     ("UTC", "UTC"),
 ]
 
+QUICK_DATE_OPTION_COUNT = 25
+QUICK_HOUR_START = 6
+QUICK_HOUR_END = 22
+QUICK_MINUTES = (0, 15, 30, 45)
+SCHEDULE_HORIZON_DAYS = 60
+EXACT_TIME_MODAL_CUSTOM_ID_PREFIX = "rota:exact-date-time:v1"
+UTC = ZoneInfo("UTC")
+
+
+class ScheduleDateTimeError(ValueError):
+    """Raised when a selected local schedule time is invalid."""
+
+
+def parse_schedule_date(value: str) -> date:
+    """Parse an exact, unambiguous ISO calendar date."""
+    cleaned = value.strip()
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", cleaned):
+        raise ScheduleDateTimeError(
+            "Date must be a valid calendar date in YYYY-MM-DD format."
+        )
+    try:
+        return date.fromisoformat(cleaned)
+    except ValueError as exc:
+        raise ScheduleDateTimeError(
+            "Date must be a valid calendar date in YYYY-MM-DD format."
+        ) from exc
+
+
+def parse_schedule_time(value: str) -> tuple[int, int]:
+    """Parse HHMM or HH:MM without accepting ambiguous variants."""
+    cleaned = value.strip()
+    match = re.fullmatch(r"([0-9]{2})(?::?)([0-9]{2})", cleaned)
+    if match is None or len(cleaned) not in (4, 5):
+        raise ScheduleDateTimeError(
+            "Time must be exactly four digits (HHMM) or HH:MM."
+        )
+
+    hour, minute = (int(part) for part in match.groups())
+    if not 0 <= hour <= 23:
+        raise ScheduleDateTimeError("Hour must be between 00 and 23.")
+    if not 0 <= minute <= 59:
+        raise ScheduleDateTimeError("Minute must be between 00 and 59.")
+    return hour, minute
+
+
+def _schedule_timezone(timezone: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(timezone)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ScheduleDateTimeError("The selected timezone is invalid.") from exc
+
+
+def _utc_now(now: datetime | None = None) -> datetime:
+    if now is None:
+        return datetime.now(tz=UTC)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must include timezone information")
+    return now.astimezone(UTC)
+
+
+def validate_schedule_day(
+    selected_day: date,
+    timezone: str,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Validate a local calendar date against past and horizon limits."""
+    tz = _schedule_timezone(timezone)
+    local_today = _utc_now(now).astimezone(tz).date()
+    if selected_day < local_today:
+        raise ScheduleDateTimeError(
+            "That date is in the past. Choose today or a future date."
+        )
+
+    latest_day = local_today + timedelta(days=SCHEDULE_HORIZON_DAYS)
+    if selected_day > latest_day:
+        raise ScheduleDateTimeError(
+            f"Date must be no later than {latest_day.isoformat()} "
+            f"({SCHEDULE_HORIZON_DAYS} calendar days from today in {timezone})."
+        )
+
+
+def validate_scheduled_datetime(
+    selected_day: str,
+    selected_hour: int,
+    selected_minute: int,
+    timezone: str,
+    *,
+    now: datetime | None = None,
+) -> datetime:
+    """Build and validate a future local datetime using an IANA timezone."""
+    day = parse_schedule_date(selected_day)
+    now_utc = _utc_now(now)
+    if (
+        not isinstance(selected_hour, int)
+        or isinstance(selected_hour, bool)
+        or not 0 <= selected_hour <= 23
+    ):
+        raise ScheduleDateTimeError("Hour must be between 00 and 23.")
+    if (
+        not isinstance(selected_minute, int)
+        or isinstance(selected_minute, bool)
+        or not 0 <= selected_minute <= 59
+    ):
+        raise ScheduleDateTimeError("Minute must be between 00 and 59.")
+
+    validate_schedule_day(day, timezone, now=now_utc)
+    tz = _schedule_timezone(timezone)
+    wall_time = (
+        day.year,
+        day.month,
+        day.day,
+        selected_hour,
+        selected_minute,
+        0,
+    )
+
+    # ZoneInfo permits construction of nonexistent wall times. A UTC round trip
+    # distinguishes real local times while retaining fold=0 for ambiguous ones.
+    local_dt = None
+    for fold in (0, 1):
+        candidate = datetime(
+            *wall_time,
+            tzinfo=tz,
+            fold=fold,
+        )
+        round_trip = candidate.astimezone(UTC).astimezone(tz)
+        round_trip_wall_time = (
+            round_trip.year,
+            round_trip.month,
+            round_trip.day,
+            round_trip.hour,
+            round_trip.minute,
+            round_trip.second,
+        )
+        if round_trip_wall_time == wall_time:
+            local_dt = candidate
+            break
+    if local_dt is None:
+        raise ScheduleDateTimeError(
+            "That local time does not exist in the selected timezone because "
+            "of a daylight-saving change."
+        )
+
+    if local_dt.astimezone(UTC) <= now_utc:
+        raise ScheduleDateTimeError(
+            "That time is in the past or present. Choose a future time."
+        )
+    return local_dt
+
+
+class _TimePickerView(discord.ui.View):
+    """Shared exact/quick time state and server-side validation."""
+
+    def __init__(self, custom_ids: dict[str, str]):
+        super().__init__(timeout=300)
+        self.selected_day: str | None = None
+        self.selected_hour: int | None = None
+        self.selected_minute: int | None = None
+        self.timezone = DEFAULT_TZ
+        self.tz_visible = False
+        self.submitted = False
+        self._custom_ids = custom_ids
+        self._build_selects()
+
+    def _build_selects(self):
+        self.clear_items()
+
+        if self.tz_visible:
+            tz_select = discord.ui.Select(
+                custom_id=self._custom_ids["timezone_select"],
+                placeholder="Select timezone",
+                row=0,
+            )
+            for label, value in TIMEZONE_CHOICES:
+                tz_select.add_option(
+                    label=label,
+                    value=value,
+                    default=(self.timezone == value),
+                )
+            tz_select.callback = self._on_tz_select
+            self.add_item(tz_select)
+        else:
+            tz_button = discord.ui.Button(
+                label="Change timezone (default: UK)",
+                style=discord.ButtonStyle.secondary,
+                custom_id=self._custom_ids["timezone_button"],
+                row=0,
+            )
+            tz_button.callback = self._on_tz_button
+            self.add_item(tz_button)
+
+        today = datetime.now(tz=_schedule_timezone(self.timezone)).date()
+        day_select = discord.ui.Select(
+            custom_id=self._custom_ids["day"],
+            placeholder="Select day",
+            row=1,
+        )
+        for offset in range(QUICK_DATE_OPTION_COUNT):
+            day = today + timedelta(days=offset)
+            value = day.isoformat()
+            if offset == 0:
+                label = f"Today — {day.strftime('%A %d %b')}"
+            elif offset == 1:
+                label = f"Tomorrow — {day.strftime('%A %d %b')}"
+            else:
+                label = day.strftime("%A %d %b")
+            day_select.add_option(
+                label=label,
+                value=value,
+                default=(self.selected_day == value),
+            )
+        day_select.callback = self._on_day_select
+        self.add_item(day_select)
+
+        hour_select = discord.ui.Select(
+            custom_id=self._custom_ids["hour"],
+            placeholder="Select hour",
+            row=2,
+        )
+        for hour in range(QUICK_HOUR_START, QUICK_HOUR_END + 1):
+            hour_select.add_option(
+                label=f"{hour:02d}:00",
+                value=str(hour),
+                default=(self.selected_hour == hour),
+            )
+        hour_select.callback = self._on_hour_select
+        self.add_item(hour_select)
+
+        minute_select = discord.ui.Select(
+            custom_id=self._custom_ids["minute"],
+            placeholder="Select minutes",
+            row=3,
+        )
+        for minute in QUICK_MINUTES:
+            minute_select.add_option(
+                label=f":{minute:02d}",
+                value=str(minute),
+                default=(self.selected_minute == minute),
+            )
+        minute_select.callback = self._on_minute_select
+        self.add_item(minute_select)
+
+        exact_button = discord.ui.Button(
+            label="Enter exact date/time",
+            style=discord.ButtonStyle.secondary,
+            custom_id=self._custom_ids["exact"],
+            row=4,
+        )
+        exact_button.callback = self._on_exact_time
+        self.add_item(exact_button)
+
+    def _selection_status(self) -> str:
+        day = self.selected_day or "—"
+        hour = (
+            f"{self.selected_hour:02d}"
+            if self.selected_hour is not None
+            else "—"
+        )
+        minute = (
+            f"{self.selected_minute:02d}"
+            if self.selected_minute is not None
+            else "—"
+        )
+        return (
+            f"Day: **{day}** | Time: **{hour}:{minute}** | "
+            f"Timezone: **{self.timezone}**"
+        )
+
+    async def _show_picker(
+        self,
+        interaction: discord.Interaction,
+        error: str | None = None,
+    ):
+        self._build_selects()
+        content = self._status_text()
+        if error:
+            content += f"\n\n{error}"
+        await interaction.response.edit_message(
+            content=content,
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _try_submit(self, interaction: discord.Interaction):
+        if self.submitted:
+            return
+        if (
+            self.selected_day is None
+            or self.selected_hour is None
+            or self.selected_minute is None
+        ):
+            await self._show_picker(interaction)
+            return
+
+        try:
+            local_dt = validate_scheduled_datetime(
+                self.selected_day,
+                self.selected_hour,
+                self.selected_minute,
+                self.timezone,
+            )
+        except ScheduleDateTimeError as exc:
+            await self._show_picker(interaction, str(exc))
+            return
+
+        self.submitted = True
+        await self._finalize_time(
+            interaction,
+            int(local_dt.timestamp()),
+            local_dt,
+        )
+
+    async def _apply_manual_input(
+        self,
+        interaction: discord.Interaction,
+        date_value: str,
+        time_value: str,
+    ):
+        date_value = date_value.strip()
+        time_value = time_value.strip()
+        missing_fields = []
+        if not date_value and self.selected_day is None:
+            missing_fields.append(
+                "Date is required because no day is selected."
+            )
+        if not time_value and (
+            self.selected_hour is None or self.selected_minute is None
+        ):
+            missing_fields.append(
+                "Time is required because a complete time is not selected."
+            )
+        if missing_fields:
+            await self._show_picker(
+                interaction,
+                " ".join(missing_fields),
+            )
+            return
+
+        candidate_day = self.selected_day
+        candidate_hour = self.selected_hour
+        candidate_minute = self.selected_minute
+        try:
+            if date_value:
+                parsed_day = parse_schedule_date(date_value)
+                validate_schedule_day(parsed_day, self.timezone)
+                candidate_day = parsed_day.isoformat()
+            if time_value:
+                candidate_hour, candidate_minute = parse_schedule_time(time_value)
+            if (
+                candidate_day is not None
+                and candidate_hour is not None
+                and candidate_minute is not None
+            ):
+                validate_scheduled_datetime(
+                    candidate_day,
+                    candidate_hour,
+                    candidate_minute,
+                    self.timezone,
+                )
+        except ScheduleDateTimeError as exc:
+            await self._show_picker(interaction, str(exc))
+            return
+
+        self.selected_day = candidate_day
+        self.selected_hour = candidate_hour
+        self.selected_minute = candidate_minute
+        await self._try_submit(interaction)
+
+    async def _on_day_select(self, interaction: discord.Interaction):
+        self.selected_day = interaction.data["values"][0]
+        await self._try_submit(interaction)
+
+    async def _on_hour_select(self, interaction: discord.Interaction):
+        self.selected_hour = int(interaction.data["values"][0])
+        await self._try_submit(interaction)
+
+    async def _on_minute_select(self, interaction: discord.Interaction):
+        self.selected_minute = int(interaction.data["values"][0])
+        await self._try_submit(interaction)
+
+    async def _on_tz_button(self, interaction: discord.Interaction):
+        self.tz_visible = True
+        await self._show_picker(interaction)
+
+    async def _on_tz_select(self, interaction: discord.Interaction):
+        self.timezone = interaction.data["values"][0]
+        await self._try_submit(interaction)
+
+    async def _on_exact_time(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(ExactDateTimeModal(self))
+
+    def _status_text(self) -> str:
+        raise NotImplementedError
+
+    async def _finalize_time(
+        self,
+        interaction: discord.Interaction,
+        unix_ts: int,
+        local_dt: datetime,
+    ):
+        raise NotImplementedError
+
+
+class ExactDateTimeModal(discord.ui.Modal):
+    """Apply optional exact date/time components to a picker."""
+
+    def __init__(self, picker: _TimePickerView):
+        super().__init__(
+            title="Enter exact date/time",
+            custom_id=(
+                f"{EXACT_TIME_MODAL_CUSTOM_ID_PREFIX}:{uuid.uuid4().hex}"
+            ),
+        )
+        self.picker = picker
+        self.date_input = discord.ui.TextInput(
+            label="Date (required if not selected)",
+            placeholder=picker.selected_day or "YYYY-MM-DD",
+            required=False,
+            max_length=10,
+        )
+        selected_time = (
+            f"{picker.selected_hour:02d}{picker.selected_minute:02d}"
+            if picker.selected_hour is not None
+            and picker.selected_minute is not None
+            else "HHMM or HH:MM"
+        )
+        self.time_input = discord.ui.TextInput(
+            label="Time (required if not selected)",
+            placeholder=selected_time,
+            required=False,
+            max_length=5,
+        )
+        self.add_item(self.date_input)
+        self.add_item(self.time_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.picker._apply_manual_input(
+            interaction,
+            self.date_input.value,
+            self.time_input.value,
+        )
+
 
 def _quote_content(content: str) -> str:
     return "\n".join(f"> {line}" for line in content.split("\n"))
+
+
+def premium_long_post_status(content: str) -> str | None:
+    """Return a concise, non-error status for X Premium long posts."""
+    if len(content) <= X_STANDARD_POST_CODEPOINTS:
+        return None
+    return f"**X Premium long post** — {len(content):,} characters (accepted)."
+
+
+def build_post_embed(content: str) -> discord.Embed:
+    """Keep up to 4,000 authored characters within Discord's embed limit."""
+    if len(content) > DISCORD_EMBED_DESCRIPTION_LIMIT:
+        content = content[: DISCORD_EMBED_DESCRIPTION_LIMIT - 1] + "…"
+    return discord.Embed(description=content)
+
+
+def _member_sort_key(user_id: str) -> tuple[int, int | str]:
+    value = str(user_id)
+    return (0, int(value)) if value.isdigit() else (1, value)
+
+
+def _format_member_mentions(label: str, user_ids: list[str]) -> str:
+    ordered = sorted({str(user_id) for user_id in user_ids}, key=_member_sort_key)
+    shown = ordered[:SCHEDULE_MEMBER_DISPLAY_LIMIT]
+    mentions = ", ".join(f"<@{user_id}>" for user_id in shown)
+    remaining = len(ordered) - len(shown)
+    suffix = f" (+{remaining} more)" if remaining else ""
+    return f"{label}: {mentions}{suffix}"
 
 
 def format_scheduled_message(
@@ -58,13 +568,17 @@ def format_scheduled_message(
     created_by_id: str,
     claimers: list[str] | None = None,
     unavailable: list[str] | None = None,
-    skip_unclaimed_pings: bool = False,
+    skip_unclaimed_pings: bool = True,
     post_to_x: bool = True,
 ) -> str:
     lines = [
         "**Scheduled Post**",
         "",
     ]
+    premium_status = premium_long_post_status(content)
+    if premium_status:
+        lines.append(premium_status)
+        lines.append("")
     if not post_to_x:
         lines.append(
             "**Manual X** — the bot will not tweet this. Claimers post on X themselves; "
@@ -73,16 +587,13 @@ def format_scheduled_message(
         lines.append("")
     lines.extend(
         [
-            _quote_content(content),
-            "",
             f"Scheduled for: <t:{scheduled_at}:F> (<t:{scheduled_at}:R>)",
             f"Scheduled by: <@{created_by_id}>",
             "",
         ]
     )
     if claimers:
-        mentions = ", ".join(f"<@{uid}>" for uid in claimers)
-        lines.append(f"Claimed by: {mentions}")
+        lines.append(_format_member_mentions("Claimed by", claimers))
     elif skip_unclaimed_pings:
         lines.append(
             "**Unclaimed** — claiming is optional; the team will **not** be pinged while this stays unclaimed."
@@ -91,31 +602,60 @@ def format_scheduled_message(
         lines.append("**Unclaimed** — click Claim to take this post!")
 
     if unavailable:
-        mentions = ", ".join(f"<@{uid}>" for uid in unavailable)
-        lines.append(f"Not available: {mentions}")
+        lines.append(_format_member_mentions("Not available", unavailable))
 
-    return "\n".join(lines)
+    message = "\n".join(lines)
+    if len(message) > DISCORD_CONTENT_LIMIT:
+        raise ValueError("scheduled-post metadata exceeded Discord's content limit")
+    return message
 
 
-def get_discord_file(image_path: str | None) -> discord.File | None:
-    if not image_path:
+def get_discord_file(media_path: str | None) -> discord.File | None:
+    if not media_path:
         return None
-    p = Path(image_path)
+    p = Path(media_path)
     if p.exists():
         return discord.File(p, filename=p.name)
     return None
 
 
-async def save_attachment(attachment: discord.Attachment) -> str | None:
-    ext = Path(attachment.filename).suffix
-    filename = f"{uuid.uuid4().hex}{ext}"
-    filepath = IMAGES_DIR / filename
+def precheck_media_attachment(attachment: discord.Attachment) -> str:
+    return media_utils.precheck_media_attachment(attachment)
+
+
+def precheck_image_attachment(attachment: discord.Attachment) -> str:
+    """Backward-compatible alias for generic media metadata validation."""
+    return precheck_media_attachment(attachment)
+
+
+def detect_image_format(data: bytes) -> str | None:
+    return media_utils.detect_image_format(data)
+
+
+async def save_validated_media_attachment(
+    attachment: discord.Attachment,
+) -> tuple[str | None, str | None]:
+    return await media_utils.save_validated_media_attachment(
+        attachment,
+        storage_dir=IMAGES_DIR,
+    )
+
+
+async def save_validated_image_attachment(
+    attachment: discord.Attachment,
+) -> tuple[str | None, str | None]:
+    """Backward-compatible alias for generic media validation/storage."""
+    return await save_validated_media_attachment(attachment)
+
+
+async def delete_uncommitted_media(media_path: str | None) -> None:
+    if not media_path:
+        return
+    path = Path(media_path)
     try:
-        await attachment.save(filepath)
-        return str(filepath)
-    except Exception:
-        log.exception(f"Failed to save attachment {attachment.filename}")
-        return None
+        await asyncio.to_thread(path.unlink, missing_ok=True)
+    except OSError:
+        log.exception("Failed to remove uncommitted media %s", path)
 
 
 # ---------------------------------------------------------------------------
@@ -144,104 +684,32 @@ class EditContentModal(discord.ui.Modal, title="Edit post content"):
         await repost_all_scheduled(self.bot)
 
 
-class EditTimeView(discord.ui.View):
+class EditTimeView(_TimePickerView):
     """Dropdowns to pick a new time for an existing post."""
 
     def __init__(self, bot: commands.Bot, post_id: int):
-        super().__init__(timeout=300)
         self.bot = bot
         self.post_id = post_id
-        self.selected_day: str | None = None
-        self.selected_hour: int | None = None
-        self.selected_minute: int | None = None
-        self.timezone: str = DEFAULT_TZ
-        self.tz_visible = False
-        self.submitted = False
-        self._build_selects()
-
-    def _build_selects(self):
-        self.clear_items()
-
-        if self.tz_visible:
-            tz_select = discord.ui.Select(
-                custom_id="et_tz_select",
-                placeholder="Select timezone",
-                row=0,
-            )
-            for label, value in TIMEZONE_CHOICES:
-                tz_select.add_option(label=label, value=value, default=(self.timezone == value))
-            tz_select.callback = self._on_tz_select
-            self.add_item(tz_select)
-        else:
-            tz_button = discord.ui.Button(
-                label="Change timezone (default: UK)",
-                style=discord.ButtonStyle.secondary,
-                custom_id="et_tz_button",
-                row=0,
-            )
-            tz_button.callback = self._on_tz_button
-            self.add_item(tz_button)
-
-        now = datetime.now(tz=ZoneInfo(self.timezone))
-        today = now.date()
-
-        day_select = discord.ui.Select(custom_id="et_day", placeholder="Select day", row=1)
-        for offset in range(7):
-            day = today + timedelta(days=offset)
-            value = day.isoformat()
-            if offset == 0:
-                label = f"Today — {day.strftime('%A %d %b')}"
-            elif offset == 1:
-                label = f"Tomorrow — {day.strftime('%A %d %b')}"
-            else:
-                label = day.strftime("%A %d %b")
-            day_select.add_option(label=label, value=value, default=(self.selected_day == value))
-        day_select.callback = self._on_day
-        self.add_item(day_select)
-
-        hour_select = discord.ui.Select(custom_id="et_hour", placeholder="Select hour", row=2)
-        for h in range(6, 23):
-            hour_select.add_option(label=f"{h:02d}:00", value=str(h), default=(self.selected_hour == h))
-        hour_select.callback = self._on_hour
-        self.add_item(hour_select)
-
-        minute_select = discord.ui.Select(custom_id="et_minute", placeholder="Select minutes", row=3)
-        for m in [0, 15, 30, 45]:
-            minute_select.add_option(label=f":{m:02d}", value=str(m), default=(self.selected_minute == m))
-        minute_select.callback = self._on_minute
-        self.add_item(minute_select)
+        super().__init__(
+            {
+                "timezone_select": "et_tz_select",
+                "timezone_button": "et_tz_button",
+                "day": "et_day",
+                "hour": "et_hour",
+                "minute": "et_minute",
+                "exact": "et_exact_time",
+            }
+        )
 
     def _status_text(self) -> str:
-        day_str = self.selected_day or "—"
-        hour_str = f"{self.selected_hour:02d}" if self.selected_hour is not None else "—"
-        minute_str = f"{self.selected_minute:02d}" if self.selected_minute is not None else "—"
-        return f"**Pick a new time:**\nDay: **{day_str}** | Time: **{hour_str}:{minute_str}** | Timezone: **{self.timezone}**"
+        return f"**Pick a new time:**\n{self._selection_status()}"
 
-    async def _try_submit(self, interaction: discord.Interaction):
-        if self.submitted:
-            return
-        if self.selected_day is None or self.selected_hour is None or self.selected_minute is None:
-            self._build_selects()
-            await interaction.response.edit_message(content=self._status_text(), view=self)
-            return
-
-        self.submitted = True
-
-        tz = ZoneInfo(self.timezone)
-        day = datetime.fromisoformat(self.selected_day)
-        dt = datetime(day.year, day.month, day.day, self.selected_hour, self.selected_minute, tzinfo=tz)
-        unix_ts = int(dt.timestamp())
-
-        now_unix = int(datetime.now(tz=ZoneInfo("UTC")).timestamp())
-        if unix_ts <= now_unix:
-            self.submitted = False
-            self._build_selects()
-            await interaction.response.edit_message(
-                content=self._status_text() + "\n\nThat time is in the past. Pick a different day or time.",
-                view=self,
-            )
-            return
-
+    async def _finalize_time(
+        self,
+        interaction: discord.Interaction,
+        unix_ts: int,
+        local_dt: datetime,
+    ):
         await update_post_scheduled_at(self.post_id, unix_ts)
         await interaction.response.edit_message(
             content=f"Time updated to <t:{unix_ts}:F> (<t:{unix_ts}:R>). Refreshing schedule...",
@@ -251,25 +719,13 @@ class EditTimeView(discord.ui.View):
         self.stop()
 
     async def _on_day(self, interaction: discord.Interaction):
-        self.selected_day = interaction.data["values"][0]
-        await self._try_submit(interaction)
+        await self._on_day_select(interaction)
 
     async def _on_hour(self, interaction: discord.Interaction):
-        self.selected_hour = int(interaction.data["values"][0])
-        await self._try_submit(interaction)
+        await self._on_hour_select(interaction)
 
     async def _on_minute(self, interaction: discord.Interaction):
-        self.selected_minute = int(interaction.data["values"][0])
-        await self._try_submit(interaction)
-
-    async def _on_tz_button(self, interaction: discord.Interaction):
-        self.tz_visible = True
-        self._build_selects()
-        await interaction.response.edit_message(content=self._status_text(), view=self)
-
-    async def _on_tz_select(self, interaction: discord.Interaction):
-        self.timezone = interaction.data["values"][0]
-        await self._try_submit(interaction)
+        await self._on_minute_select(interaction)
 
 
 class EditMediaView(discord.ui.View):
@@ -297,12 +753,17 @@ class EditMediaView(discord.ui.View):
         self.handled = True
 
         post = await get_post_by_id(self.post_id)
+        await update_post_image(self.post_id, None)
         if post and post.get("image_path"):
             p = Path(post["image_path"])
-            if p.exists():
+            try:
                 p.unlink(missing_ok=True)
-
-        await update_post_image(self.post_id, None)
+            except OSError:
+                log.exception(
+                    "Media removed from post %s but stored file could not be deleted: %s",
+                    self.post_id,
+                    p,
+                )
         await interaction.response.edit_message(content="Media removed. Refreshing schedule...", view=None)
         await repost_all_scheduled(self.bot)
         self.stop()
@@ -315,7 +776,7 @@ class EditMediaView(discord.ui.View):
 class PostButtonView(discord.ui.View):
     """Buttons attached to each scheduled post message."""
 
-    def __init__(self, bot: commands.Bot, post_id: int, skip_unclaimed_pings: bool = False):
+    def __init__(self, bot: commands.Bot, post_id: int, skip_unclaimed_pings: bool = True):
         super().__init__(timeout=None)
         self.bot = bot
         self.post_id = post_id
@@ -357,14 +818,14 @@ class PostButtonView(discord.ui.View):
 
         if skip_unclaimed_pings:
             ping_btn = discord.ui.Button(
-                label="Ping team if unclaimed",
+                label="Require a claimer",
                 style=discord.ButtonStyle.secondary,
                 custom_id=f"skippings:{post_id}",
                 row=2,
             )
         else:
             ping_btn = discord.ui.Button(
-                label="No team ping if unclaimed",
+                label="Claimer not required",
                 style=discord.ButtonStyle.secondary,
                 custom_id=f"skippings:{post_id}",
                 row=2,
@@ -429,11 +890,13 @@ class PostButtonView(discord.ui.View):
         has_media = bool(post.get("image_path"))
         media_view = EditMediaView(self.bot, self.post_id, has_media)
 
-        status = "Current post has an attached image." if has_media else "No media currently attached."
+        status = "Current post has attached media." if has_media else "No media currently attached."
         await interaction.response.send_message(
             content=(
                 f"{status}\n\n"
-                f"To upload new media, use `/updatemedia` and attach your image."
+                "To add or replace it, use `/updatemedia` and attach one JPG, "
+                "PNG, WebP, GIF, or MP4. Video must be MP4/H.264 and no longer "
+                "than 140 seconds; GIF/video limits are checked."
             ),
             view=media_view,
             ephemeral=True,
@@ -460,56 +923,164 @@ class PostButtonView(discord.ui.View):
             post_to_x=post_to_x,
         )
         new_view = PostButtonView(self.bot, self.post_id, skip_unclaimed_pings=skip_pings)
-        await interaction.response.edit_message(content=new_content, view=new_view)
+        await interaction.response.edit_message(
+            content=new_content,
+            embed=build_post_embed(post["content"]),
+            view=new_view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
 
 # ---------------------------------------------------------------------------
 # Repost helper
 # ---------------------------------------------------------------------------
 
-async def repost_all_scheduled(bot: commands.Bot):
-    """Delete all bot messages in the scheduled channel and repost everything in chronological order."""
-    channel = bot.get_channel(SCHEDULED_CHANNEL_ID)
-    if not channel:
-        log.warning("Cannot repost: scheduled channel not found")
-        return
+class SchedulePanelView(discord.ui.View):
+    """Persistent entry point for the unified scheduling flow."""
 
-    posts = await get_all_scheduled_posts()
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=None)
+        self.bot = bot
 
-    # Invalidate all message IDs in DB first so on_raw_message_delete won't remove posts
-    for post in posts:
-        await update_post_message_id(post["id"], f"reposting_{post['id']}")
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.channel_id != SCHEDULED_CHANNEL_ID:
+            await interaction.response.send_message(
+                f"This button can only be used in <#{SCHEDULED_CHANNEL_ID}>.",
+                ephemeral=True,
+            )
+            return False
+        return True
 
-    # Delete all bot messages from the channel
-    async for msg in channel.history(limit=500):
-        if msg.author == bot.user:
-            try:
-                await msg.delete()
-            except discord.NotFound:
-                pass
-
-    # Repost (DESC = furthest first, soonest last = soonest at bottom of chat)
-    for post in posts:
-        claimers = await get_claimers_for_post(post["id"])
-        unavailable = await get_unavailable_for_post(post["id"])
-        skip_pings = bool(post.get("skip_unclaimed_pings"))
-        post_to_x = bool(post.get("post_to_x", 1))
-        content = format_scheduled_message(
-            post["content"],
-            post["scheduled_at"],
-            post["created_by"],
-            claimers,
-            unavailable,
-            skip_unclaimed_pings=skip_pings,
-            post_to_x=post_to_x,
+    @discord.ui.button(
+        label="Schedule post",
+        style=discord.ButtonStyle.primary,
+        custom_id=SCHEDULE_PANEL_CUSTOM_ID,
+    )
+    async def schedule_post(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.send_modal(
+            SchedulePostModal(self.bot, interaction.user.id)
         )
-        view = PostButtonView(bot, post["id"], skip_unclaimed_pings=skip_pings)
-        file = get_discord_file(post.get("image_path"))
-        no_pings = discord.AllowedMentions.none()
-        msg = await channel.send(content, view=view, file=file, allowed_mentions=no_pings)
-        await update_post_message_id(post["id"], str(msg.id))
 
-    log.info(f"Reposted {len(posts)} scheduled posts in chronological order")
+
+async def send_schedule_panel(channel, bot: commands.Bot) -> discord.Message | None:
+    """Send one scheduling panel to the configured scheduled channel."""
+    channel_id = getattr(channel, "id", None)
+    if channel_id != SCHEDULED_CHANNEL_ID:
+        log.warning(
+            "Refusing to send schedule panel outside configured channel %s (got %s)",
+            SCHEDULED_CHANNEL_ID,
+            channel_id,
+        )
+        return None
+
+    try:
+        return await channel.send(
+            SCHEDULE_PANEL_TEXT,
+            view=SchedulePanelView(bot),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except Exception:
+        log.exception("Failed to send schedule panel in channel %s", channel_id)
+        return None
+
+
+def get_schedule_refresh_lock(bot: commands.Bot) -> asyncio.Lock:
+    """Return the single refresh lock owned by this bot instance."""
+    lock = vars(bot).get("_rota_schedule_repost_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        vars(bot)["_rota_schedule_repost_lock"] = lock
+    return lock
+
+
+# Backward-compatible internal name used by earlier phase tests/integrations.
+_get_repost_lock = get_schedule_refresh_lock
+
+
+async def repost_all_scheduled(bot: commands.Bot) -> bool:
+    """Atomically refresh scheduled messages and return whether it succeeded."""
+    async with get_schedule_refresh_lock(bot):
+        channel = bot.get_channel(SCHEDULED_CHANNEL_ID)
+        if not channel:
+            log.warning(
+                "Schedule refresh failed: configured channel %s was not found",
+                SCHEDULED_CHANNEL_ID,
+            )
+            return False
+
+        stage = "querying scheduled posts"
+        try:
+            # Query only after acquiring the lock so queued refreshes use current data.
+            posts = await get_all_scheduled_posts()
+
+            stage = "invalidating stored message IDs"
+            for post in posts:
+                await update_post_message_id(
+                    post["id"], f"reposting_{post['id']}"
+                )
+
+            stage = "deleting existing bot messages"
+            async for msg in channel.history(limit=500):
+                if msg.author == bot.user:
+                    try:
+                        await msg.delete()
+                    except discord.NotFound:
+                        pass
+
+            stage = "sending scheduled post messages"
+            for post in posts:
+                claimers = await get_claimers_for_post(post["id"])
+                unavailable = await get_unavailable_for_post(post["id"])
+                skip_pings = bool(post.get("skip_unclaimed_pings"))
+                post_to_x = bool(post.get("post_to_x", 1))
+                content = format_scheduled_message(
+                    post["content"],
+                    post["scheduled_at"],
+                    post["created_by"],
+                    claimers,
+                    unavailable,
+                    skip_unclaimed_pings=skip_pings,
+                    post_to_x=post_to_x,
+                )
+                view = PostButtonView(
+                    bot, post["id"], skip_unclaimed_pings=skip_pings
+                )
+                file = get_discord_file(post.get("image_path"))
+                send_kwargs = {
+                    "embed": build_post_embed(post["content"]),
+                    "view": view,
+                    "allowed_mentions": discord.AllowedMentions.none(),
+                }
+                if file is not None:
+                    send_kwargs["file"] = file
+                msg = await channel.send(content, **send_kwargs)
+                await update_post_message_id(post["id"], str(msg.id))
+
+            stage = "sending schedule panel"
+            panel = await send_schedule_panel(channel, bot)
+            if panel is None:
+                log.error(
+                    "Schedule refresh failed while %s in channel %s",
+                    stage,
+                    SCHEDULED_CHANNEL_ID,
+                )
+                return False
+        except Exception:
+            log.exception(
+                "Schedule refresh failed while %s in channel %s; "
+                "a later refresh will rebuild IDs and messages",
+                stage,
+                SCHEDULED_CHANNEL_ID,
+            )
+            return False
+
+        log.info(
+            "Schedule refresh succeeded: reposted %s posts followed by the panel",
+            len(posts),
+        )
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -525,147 +1096,203 @@ class PostContentModal(discord.ui.Modal, title="Write your post"):
         max_length=4000,
     )
 
-    def __init__(self, bot: commands.Bot, user_id: int, image_path: str | None, post_to_x: bool = True):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        user_id: int,
+        attachment: discord.Attachment | None,
+        post_to_x: bool = True,
+    ):
         super().__init__()
         self.bot = bot
         self.user_id = user_id
-        self.image_path = image_path
+        self.attachment = attachment
         self.post_to_x = post_to_x
+        self._saved_media_path: str | None = None
 
     async def on_submit(self, interaction: discord.Interaction):
-        content = self.content_input.value
-        view = ScheduleView(self.bot, content, self.user_id, self.image_path, post_to_x=self.post_to_x)
-        await interaction.response.send_message(
-            content=view._status_text(),
-            view=view,
-            ephemeral=True,
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        media_path = None
+        if self.attachment:
+            media_path, error = await save_validated_media_attachment(
+                self.attachment
+            )
+            if error:
+                await interaction.followup.send(error, ephemeral=True)
+                return
+            self._saved_media_path = media_path
+
+        view = ScheduleView(
+            self.bot,
+            self.content_input.value,
+            self.user_id,
+            media_path,
+            post_to_x=self.post_to_x,
+        )
+        try:
+            await interaction.followup.send(
+                content=view._status_text(),
+                view=view,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception:
+            await delete_uncommitted_media(self._saved_media_path)
+            self._saved_media_path = None
+            view.media_path = None
+            raise
+        self._saved_media_path = None
+
+    async def on_timeout(self):
+        await delete_uncommitted_media(self._saved_media_path)
+        self._saved_media_path = None
+
+
+class SchedulePostModal(discord.ui.Modal, title="Schedule a post"):
+    """Collect post content and one optional media file in one modal."""
+
+    def __init__(self, bot: commands.Bot, user_id: int):
+        super().__init__()
+        self.bot = bot
+        self.user_id = user_id
+        self._saved_media_path: str | None = None
+        self.content_input = discord.ui.TextInput(
+            style=discord.TextStyle.long,
+            placeholder="Write your post here... line breaks are preserved!",
+            required=True,
+            max_length=4000,
+        )
+        self.file_upload = discord.ui.FileUpload(
+            custom_id="schedule_post_media",
+            required=False,
+            min_values=0,
+            max_values=1,
+        )
+        self.add_item(
+            discord.ui.Label(text="Post content", component=self.content_input)
+        )
+        self.add_item(
+            discord.ui.Label(
+                text="Media (optional)",
+                description=(
+                    "JPG/PNG/WebP ≤5 MiB; GIF ≤15 MiB. Video: MP4/H.264, "
+                    "≤140s. GIF/video limits checked."
+                ),
+                component=self.file_upload,
+            )
         )
 
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
-class ScheduleView(discord.ui.View):
+        attachment = self.file_upload.values[0] if self.file_upload.values else None
+        media_path = None
+        if attachment:
+            media_path, error = await save_validated_media_attachment(attachment)
+            if error:
+                await interaction.followup.send(error, ephemeral=True)
+                return
+            self._saved_media_path = media_path
+
+        view = ScheduleView(
+            self.bot,
+            self.content_input.value,
+            self.user_id,
+            media_path,
+            post_to_x=True,
+        )
+        try:
+            await interaction.followup.send(
+                content=view._status_text(),
+                view=view,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception:
+            await delete_uncommitted_media(self._saved_media_path)
+            self._saved_media_path = None
+            view.media_path = None
+            raise
+        self._saved_media_path = None
+
+    async def on_timeout(self):
+        await delete_uncommitted_media(self._saved_media_path)
+        self._saved_media_path = None
+
+
+class ScheduleView(_TimePickerView):
     def __init__(
         self,
         bot: commands.Bot,
         content: str,
         user_id: int,
-        image_path: str | None = None,
+        media_path: str | None = None,
         post_to_x: bool = True,
     ):
-        super().__init__(timeout=300)
         self.bot = bot
         self.content = content
         self.user_id = user_id
-        self.image_path = image_path
+        self.media_path = media_path
         self.post_to_x = post_to_x
-        self.selected_day: str | None = None
-        self.selected_hour: int | None = None
-        self.selected_minute: int | None = None
-        self.timezone: str = DEFAULT_TZ
-        self.tz_visible = False
-        self.submitted = False
-
-        self._build_selects()
-
-    def _build_selects(self):
-        self.clear_items()
-
-        if self.tz_visible:
-            tz_select = discord.ui.Select(
-                custom_id="tz_select", placeholder="Select timezone", row=0,
-            )
-            for label, value in TIMEZONE_CHOICES:
-                tz_select.add_option(label=label, value=value, default=(self.timezone == value))
-            tz_select.callback = self._on_tz_select
-            self.add_item(tz_select)
-        else:
-            tz_button = discord.ui.Button(
-                label="Change timezone (default: UK)",
-                style=discord.ButtonStyle.secondary,
-                custom_id="tz_button", row=0,
-            )
-            tz_button.callback = self._on_tz_button
-            self.add_item(tz_button)
-
-        now = datetime.now(tz=ZoneInfo(self.timezone))
-        today = now.date()
-
-        day_select = discord.ui.Select(custom_id="day_select", placeholder="Select day", row=1)
-        for offset in range(7):
-            day = today + timedelta(days=offset)
-            value = day.isoformat()
-            if offset == 0:
-                label = f"Today — {day.strftime('%A %d %b')}"
-            elif offset == 1:
-                label = f"Tomorrow — {day.strftime('%A %d %b')}"
-            else:
-                label = day.strftime("%A %d %b")
-            day_select.add_option(label=label, value=value, default=(self.selected_day == value))
-        day_select.callback = self._on_day_select
-        self.add_item(day_select)
-
-        hour_select = discord.ui.Select(custom_id="hour_select", placeholder="Select hour", row=2)
-        for h in range(6, 23):
-            hour_select.add_option(label=f"{h:02d}:00", value=str(h), default=(self.selected_hour == h))
-        hour_select.callback = self._on_hour_select
-        self.add_item(hour_select)
-
-        minute_select = discord.ui.Select(custom_id="minute_select", placeholder="Select minutes", row=3)
-        for m in [0, 15, 30, 45]:
-            minute_select.add_option(label=f":{m:02d}", value=str(m), default=(self.selected_minute == m))
-        minute_select.callback = self._on_minute_select
-        self.add_item(minute_select)
+        super().__init__(
+            {
+                "timezone_select": "tz_select",
+                "timezone_button": "tz_button",
+                "day": "day_select",
+                "hour": "hour_select",
+                "minute": "minute_select",
+                "exact": "exact_time",
+            }
+        )
 
     def _status_text(self) -> str:
         preview = self.content[:100] + ("..." if len(self.content) > 100 else "")
         parts = [f"**Scheduling post:**\n{_quote_content(preview)}\n"]
 
-        if self.image_path:
-            parts.append("Image attached\n")
+        premium_status = premium_long_post_status(self.content)
+        if premium_status:
+            parts.append(f"{premium_status}\n")
+
+        if self.media_path:
+            parts.append("Media attached\n")
 
         if not self.post_to_x:
             parts.append("**Manual X** — bot will not tweet; you post on X when the slot is live.\n")
 
-        day_str = self.selected_day or "—"
-        hour_str = f"{self.selected_hour:02d}" if self.selected_hour is not None else "—"
-        minute_str = f"{self.selected_minute:02d}" if self.selected_minute is not None else "—"
-
-        parts.append(f"Day: **{day_str}** | Time: **{hour_str}:{minute_str}** | Timezone: **{self.timezone}**")
+        parts.append(self._selection_status())
 
         return "\n".join(parts)
 
-    async def _try_submit(self, interaction: discord.Interaction):
-        if self.submitted:
-            return
-        if self.selected_day is None or self.selected_hour is None or self.selected_minute is None:
-            self._build_selects()
-            await interaction.response.edit_message(content=self._status_text(), view=self)
-            return
-
-        self.submitted = True
-
-        tz = ZoneInfo(self.timezone)
-        day = datetime.fromisoformat(self.selected_day)
-        dt = datetime(day.year, day.month, day.day, self.selected_hour, self.selected_minute, tzinfo=tz)
-        unix_ts = int(dt.timestamp())
-
-        now_unix = int(datetime.now(tz=ZoneInfo("UTC")).timestamp())
-        if unix_ts <= now_unix:
-            self.submitted = False
-            self._build_selects()
-            await interaction.response.edit_message(
-                content=self._status_text() + "\n\nThat time is in the past. Pick a different day or time.",
-                view=self,
+    async def _finalize_time(
+        self,
+        interaction: discord.Interaction,
+        unix_ts: int,
+        local_dt: datetime,
+    ):
+        try:
+            await insert_post(
+                discord_message_id="pending",
+                content=self.content,
+                scheduled_at=unix_ts,
+                created_by=str(self.user_id),
+                image_path=self.media_path,
+                post_to_x=self.post_to_x,
             )
+        except Exception:
+            self.submitted = False
+            await delete_uncommitted_media(self.media_path)
+            self.media_path = None
+            log.exception("Failed to save scheduled post for user %s", self.user_id)
+            await interaction.response.edit_message(
+                content="The post could not be saved. Please start the scheduling flow again.",
+                view=None,
+            )
+            self.stop()
             return
 
-        await insert_post(
-            discord_message_id="pending",
-            content=self.content,
-            scheduled_at=unix_ts,
-            created_by=str(self.user_id),
-            image_path=self.image_path,
-            post_to_x=self.post_to_x,
-        )
+        # The database now owns the file; timeout cleanup must not remove it.
+        self.media_path = None
 
         await interaction.response.edit_message(
             content=f"Post scheduled for <t:{unix_ts}:F> (<t:{unix_ts}:R>). Updating the schedule...",
@@ -674,36 +1301,24 @@ class ScheduleView(discord.ui.View):
 
         await repost_all_scheduled(self.bot)
 
-        log.info(f"Post scheduled by {self.user_id} for {dt.isoformat()}")
+        log.info(
+            "Post scheduled by %s for %s",
+            self.user_id,
+            local_dt.isoformat(),
+        )
         self.stop()
 
-    async def _on_day_select(self, interaction: discord.Interaction):
-        self.selected_day = interaction.data["values"][0]
-        await self._try_submit(interaction)
-
-    async def _on_hour_select(self, interaction: discord.Interaction):
-        self.selected_hour = int(interaction.data["values"][0])
-        await self._try_submit(interaction)
-
-    async def _on_minute_select(self, interaction: discord.Interaction):
-        self.selected_minute = int(interaction.data["values"][0])
-        await self._try_submit(interaction)
-
-    async def _on_tz_button(self, interaction: discord.Interaction):
-        self.tz_visible = True
-        self._build_selects()
-        await interaction.response.edit_message(content=self._status_text(), view=self)
-
-    async def _on_tz_select(self, interaction: discord.Interaction):
-        self.timezone = interaction.data["values"][0]
-        await self._try_submit(interaction)
-
     async def on_timeout(self):
-        pass
+        if not self.submitted:
+            await delete_uncommitted_media(self.media_path)
+            self.media_path = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message("Only the person who ran /schedule can use this.", ephemeral=True)
+            await interaction.response.send_message(
+                "Only the person who started this schedule can use it.",
+                ephemeral=True,
+            )
             return False
         return True
 
@@ -716,23 +1331,46 @@ class ScheduleCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._startup_done = False
+        self._startup_refreshing = False
+
+    async def cog_load(self):
+        self.bot.add_view(SchedulePanelView(self.bot))
 
     @commands.Cog.listener()
     async def on_ready(self):
-        if self._startup_done:
+        if self._startup_done or self._startup_refreshing:
             return
-        self._startup_done = True
-        await repost_all_scheduled(self.bot)
+
+        self._startup_refreshing = True
+        try:
+            if await repost_all_scheduled(self.bot):
+                self._startup_done = True
+                return
+
+            log.warning(
+                "Initial schedule refresh failed; retrying once in %s seconds",
+                STARTUP_REFRESH_RETRY_SECONDS,
+            )
+            await asyncio.sleep(STARTUP_REFRESH_RETRY_SECONDS)
+            if await repost_all_scheduled(self.bot):
+                self._startup_done = True
+            else:
+                log.error(
+                    "Startup schedule refresh failed after one retry; "
+                    "the next ready event will retry"
+                )
+        finally:
+            self._startup_refreshing = False
 
     @app_commands.command(name="schedule", description="Schedule a post for X")
     @app_commands.describe(
-        image="Optional image to include with the post",
+        media="Optional JPG/PNG/WebP/GIF or MP4/H.264 video (max 140 seconds)",
         post_to_x="If off, the bot does not tweet or send tweet links; claimers post on X manually. Reminders unchanged.",
     )
     async def schedule(
         self,
         interaction: discord.Interaction,
-        image: discord.Attachment | None = None,
+        media: discord.Attachment | None = None,
         post_to_x: bool = True,
     ):
         if interaction.channel_id != SCHEDULED_CHANNEL_ID:
@@ -742,28 +1380,33 @@ class ScheduleCog(commands.Cog):
             )
             return
 
-        image_path = None
-        if image:
-            if not image.content_type or not image.content_type.startswith("image/"):
+        if media:
+            try:
+                precheck_media_attachment(media)
+            except media_utils.MediaValidationError as exc:
                 await interaction.response.send_message(
-                    "That file doesn't look like an image. Please attach a JPG, PNG, GIF, or WebP.",
-                    ephemeral=True,
-                )
-                return
-            image_path = await save_attachment(image)
-            if not image_path:
-                await interaction.response.send_message(
-                    "Failed to save the image. Please try again.",
+                    str(exc),
                     ephemeral=True,
                 )
                 return
 
-        modal = PostContentModal(self.bot, interaction.user.id, image_path, post_to_x=post_to_x)
+        modal = PostContentModal(
+            self.bot,
+            interaction.user.id,
+            media,
+            post_to_x=post_to_x,
+        )
         await interaction.response.send_modal(modal)
 
     @app_commands.command(name="updatemedia", description="Add or replace the media on a scheduled post")
-    @app_commands.describe(image="The new image to attach")
-    async def updatemedia(self, interaction: discord.Interaction, image: discord.Attachment):
+    @app_commands.describe(
+        media="One JPG/PNG/WebP/GIF or MP4/H.264 video (max 140 seconds)"
+    )
+    async def updatemedia(
+        self,
+        interaction: discord.Interaction,
+        media: discord.Attachment,
+    ):
         if interaction.channel_id != SCHEDULED_CHANNEL_ID:
             await interaction.response.send_message(
                 f"This command can only be used in <#{SCHEDULED_CHANNEL_ID}>.",
@@ -771,9 +1414,11 @@ class ScheduleCog(commands.Cog):
             )
             return
 
-        if not image.content_type or not image.content_type.startswith("image/"):
+        try:
+            precheck_media_attachment(media)
+        except media_utils.MediaValidationError as exc:
             await interaction.response.send_message(
-                "That file doesn't look like an image. Please attach a JPG, PNG, GIF, or WebP.",
+                str(exc),
                 ephemeral=True,
             )
             return
@@ -784,11 +1429,12 @@ class ScheduleCog(commands.Cog):
             return
 
         # Show a dropdown to pick which post to update
-        view = MediaPostPicker(self.bot, posts, image)
+        view = MediaPostPicker(self.bot, posts, media)
         await interaction.response.send_message(
-            "Which post do you want to attach this image to?",
+            view.status_text(),
             view=view,
             ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     @commands.Cog.listener()
@@ -809,44 +1455,140 @@ class ScheduleCog(commands.Cog):
 
 
 class MediaPostPicker(discord.ui.View):
-    """Dropdown to pick which scheduled post gets the new media."""
+    """Paginated dropdown that keeps one pending replacement attachment."""
 
     def __init__(self, bot: commands.Bot, posts: list[dict], attachment: discord.Attachment):
         super().__init__(timeout=120)
         self.bot = bot
+        self.posts = list(posts)
         self.attachment = attachment
+        self.handled = False
+        self.page_index = 0
+        self.page_count = max(
+            1,
+            (len(self.posts) + MEDIA_PICKER_PAGE_SIZE - 1)
+            // MEDIA_PICKER_PAGE_SIZE,
+        )
+        self._build_page()
 
-        select = discord.ui.Select(placeholder="Select a post", custom_id="media_pick", row=0)
-        for post in posts:
-            preview = post["content"][:80].replace("\n", " ")
+    def status_text(self) -> str:
+        start = self.page_index * MEDIA_PICKER_PAGE_SIZE + 1
+        end = min(
+            len(self.posts),
+            (self.page_index + 1) * MEDIA_PICKER_PAGE_SIZE,
+        )
+        return (
+            "Which post do you want to attach this media to?\n"
+            f"Page **{self.page_index + 1}/{self.page_count}** "
+            f"(posts {start}-{end} of {len(self.posts)})."
+        )
+
+    def _build_page(self) -> None:
+        self.clear_items()
+        start = self.page_index * MEDIA_PICKER_PAGE_SIZE
+        page_posts = self.posts[start : start + MEDIA_PICKER_PAGE_SIZE]
+        select = discord.ui.Select(
+            placeholder="Select a post",
+            custom_id="media_pick",
+            row=0,
+        )
+        for post in page_posts:
+            preview = post["content"][:80].replace("\n", " ").strip()
             select.add_option(
-                label=preview,
+                label=preview or "(empty post)",
                 value=str(post["id"]),
                 description=f"Scheduled for <t:{post['scheduled_at']}:f>",
             )
         select.callback = self._on_select
         self.add_item(select)
 
+        if self.page_count > 1:
+            previous = discord.ui.Button(
+                label="Prev",
+                style=discord.ButtonStyle.secondary,
+                custom_id="media_pick_prev",
+                row=1,
+                disabled=self.page_index == 0,
+            )
+            previous.callback = self._on_previous
+            self.add_item(previous)
+
+            next_button = discord.ui.Button(
+                label="Next",
+                style=discord.ButtonStyle.secondary,
+                custom_id="media_pick_next",
+                row=1,
+                disabled=self.page_index == self.page_count - 1,
+            )
+            next_button.callback = self._on_next
+            self.add_item(next_button)
+
+    async def _show_page(self, interaction: discord.Interaction) -> None:
+        self._build_page()
+        await interaction.response.edit_message(
+            content=self.status_text(),
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _on_previous(self, interaction: discord.Interaction):
+        if self.page_index > 0:
+            self.page_index -= 1
+        await self._show_page(interaction)
+
+    async def _on_next(self, interaction: discord.Interaction):
+        if self.page_index < self.page_count - 1:
+            self.page_index += 1
+        await self._show_page(interaction)
+
     async def _on_select(self, interaction: discord.Interaction):
+        if self.handled:
+            return
+        self.handled = True
+        await interaction.response.defer()
+
         post_id = int(interaction.data["values"][0])
         post = await get_post_by_id(post_id)
         if not post:
-            await interaction.response.edit_message(content="That post no longer exists.", view=None)
+            await interaction.edit_original_response(
+                content="That post no longer exists.", view=None
+            )
             return
 
-        # Remove old image file if it exists
+        media_path, error = await save_validated_media_attachment(self.attachment)
+        if error:
+            await interaction.edit_original_response(content=error, view=None)
+            return
+
+        try:
+            await update_post_image(post_id, media_path)
+        except Exception:
+            # The old DB reference remains intact; remove only the unused new file.
+            if media_path:
+                try:
+                    Path(media_path).unlink(missing_ok=True)
+                except OSError:
+                    log.exception(
+                        "Failed to remove unused replacement media %s",
+                        media_path,
+                    )
+            raise
+
+        # Delete the old file only after the new DB reference is committed.
         if post.get("image_path"):
             p = Path(post["image_path"])
-            if p.exists():
+            try:
                 p.unlink(missing_ok=True)
-
-        image_path = await save_attachment(self.attachment)
-        if not image_path:
-            await interaction.response.edit_message(content="Failed to save the image. Try again.", view=None)
-            return
-
-        await update_post_image(post_id, image_path)
-        await interaction.response.edit_message(content="Media updated. Refreshing schedule...", view=None)
+            except OSError:
+                log.exception(
+                    "Post %s now uses %s but old media could not be deleted: %s",
+                    post_id,
+                    media_path,
+                    p,
+                )
+        await interaction.edit_original_response(
+            content="Media updated. Refreshing schedule...", view=None
+        )
         await repost_all_scheduled(self.bot)
         self.stop()
 

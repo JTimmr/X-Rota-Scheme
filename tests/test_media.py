@@ -82,6 +82,8 @@ class MediaMetadataTests(unittest.TestCase):
             ("photo.webp", "application/octet-stream", "webp"),
             ("animation.gif", "image/gif", "gif"),
             ("video.mp4", "video/mp4; charset=binary", "mp4"),
+            ("iphone.mp4", "video/quicktime", "mp4"),
+            ("iphone-export.mp4", "video/x-m4v", "mp4"),
         )
         for filename, content_type, expected in cases:
             with self.subTest(filename=filename):
@@ -100,7 +102,7 @@ class MediaMetadataTests(unittest.TestCase):
             ("payload.exe", "image/png"),
             ("photo.jpg", "image/png"),
             ("photo.png", "video/mp4"),
-            ("clip.mp4", "video/quicktime"),
+            ("clip.mov", "video/quicktime"),
             ("no-extension", None),
         )
         for filename, content_type in cases:
@@ -249,6 +251,29 @@ class MediaStorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(saved)
             self.assertIn("could not inspect", error)
             self.assertEqual(list(Path(temp_dir).iterdir()), [])
+
+    async def test_iphone_mime_mp4_reaches_content_validation_and_is_saved(self):
+        video_data = b"\x00\x00\x00\x18ftypisommp4"
+        candidate = attachment(
+            "iphone.mp4",
+            "video/quicktime",
+            video_data,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(
+                media,
+                "probe_and_validate_mp4",
+                new=AsyncMock(),
+            ) as validate_mp4:
+                saved, error = await media.save_validated_media_attachment(
+                    candidate,
+                    storage_dir=temp_dir,
+                )
+
+            self.assertIsNone(error)
+            self.assertEqual(Path(saved).suffix, ".mp4")
+            self.assertEqual(Path(saved).read_bytes(), video_data)
+            validate_mp4.assert_awaited_once()
 
     async def test_download_failure_removes_temporary_file(self):
         candidate = attachment("image.png", "image/png", b"unused")

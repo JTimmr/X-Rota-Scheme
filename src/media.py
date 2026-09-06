@@ -57,6 +57,12 @@ MEDIA_CONTENT_TYPES = {
     "image/gif": "gif",
     "video/mp4": "mp4",
     "application/mp4": "mp4",
+    # Discord can report valid iPhone-originated .mp4 files with an Apple MIME
+    # type. Treat these as MP4 candidates; signature and ffprobe validation
+    # below still reject actual MOV containers, HEVC, and other unsupported
+    # content.
+    "video/quicktime": "mp4",
+    "video/x-m4v": "mp4",
 }
 GENERIC_CONTENT_TYPES = {
     "application/octet-stream",

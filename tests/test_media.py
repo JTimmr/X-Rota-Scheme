@@ -84,6 +84,8 @@ class MediaMetadataTests(unittest.TestCase):
             ("video.mp4", "video/mp4; charset=binary", "mp4"),
             ("iphone.mp4", "video/quicktime", "mp4"),
             ("iphone-export.mp4", "video/x-m4v", "mp4"),
+            ("1788034936043.mp4", "video/hevc", "mp4"),
+            ("090606EA-1944-4A14-972F-725186A0CA52.png", "image/jpeg", "png"),
         )
         for filename, content_type, expected in cases:
             with self.subTest(filename=filename):
@@ -97,13 +99,21 @@ class MediaMetadataTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_iphone_image_metadata_mismatch_is_deferred_to_contents(self):
+        candidate = SimpleNamespace(
+            filename="photo.jpg",
+            content_type="image/png",
+            size=1,
+        )
+        self.assertEqual(media.precheck_media_attachment(candidate), "jpeg")
+
     def test_unsupported_and_metadata_mismatches_are_rejected(self):
         cases = (
             ("payload.exe", "image/png"),
-            ("photo.jpg", "image/png"),
             ("photo.png", "video/mp4"),
             ("clip.mov", "video/quicktime"),
             ("no-extension", None),
+            ("photo.heic", "image/heic"),
         )
         for filename, content_type in cases:
             with self.subTest(filename=filename), self.assertRaises(
@@ -193,12 +203,60 @@ class MediaStorageTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(Path(saved).read_bytes(), data)
                     Path(saved).unlink()
 
+    async def test_iphone_png_name_with_jpeg_contents_is_saved_as_jpeg(self):
+        jpeg_data = image_bytes("JPEG")
+        cases = (
+            ("090606EA-1944-4A14-972F-725186A0CA52.png", "image/png", jpeg_data),
+            ("090606EA-1944-4A14-972F-725186A0CA52.png", "image/jpeg", jpeg_data),
+            ("photo.jpg", "image/png", image_bytes("PNG")),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for filename, content_type, data in cases:
+                with self.subTest(filename=filename, content_type=content_type):
+                    saved, error = await media.save_validated_media_attachment(
+                        attachment(filename, content_type, data),
+                        storage_dir=temp_dir,
+                    )
+                    self.assertIsNone(error)
+                    saved_path = Path(saved)
+                    if data.startswith(b"\xff\xd8\xff"):
+                        self.assertEqual(saved_path.suffix, ".jpg")
+                    else:
+                        self.assertEqual(saved_path.suffix, ".png")
+                    self.assertEqual(saved_path.read_bytes(), data)
+                    saved_path.unlink()
+
+    async def test_heic_and_mov_signatures_get_specific_errors(self):
+        cases = (
+            (
+                "photo.png",
+                "image/png",
+                b"\x00\x00\x00\x18ftypheic",
+                "HEIC",
+            ),
+            (
+                "clip.mp4",
+                "video/mp4",
+                b"\x00\x00\x00\x18ftypqt  ",
+                "QuickTime/MOV",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for filename, content_type, data, needle in cases:
+                with self.subTest(filename=filename):
+                    saved, error = await media.save_validated_media_attachment(
+                        attachment(filename, content_type, data),
+                        storage_dir=temp_dir,
+                    )
+                    self.assertIsNone(saved)
+                    self.assertIn(needle, error)
+                    self.assertEqual(list(Path(temp_dir).iterdir()), [])
+
     async def test_corrupt_truncated_and_spoofed_files_are_cleaned_up(self):
         valid_png = image_bytes("PNG", size=(64, 64))
         cases = (
             ("corrupt.png", "image/png", valid_png[:30]),
             ("spoofed.png", "image/png", b"MZ executable"),
-            ("mismatch.jpg", "image/jpeg", valid_png),
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             for filename, content_type, data in cases:
@@ -254,26 +312,26 @@ class MediaStorageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_iphone_mime_mp4_reaches_content_validation_and_is_saved(self):
         video_data = b"\x00\x00\x00\x18ftypisommp4"
-        candidate = attachment(
-            "iphone.mp4",
-            "video/quicktime",
-            video_data,
-        )
+        cases = ("video/quicktime", "video/hevc")
         with tempfile.TemporaryDirectory() as temp_dir:
-            with patch.object(
-                media,
-                "probe_and_validate_mp4",
-                new=AsyncMock(),
-            ) as validate_mp4:
-                saved, error = await media.save_validated_media_attachment(
-                    candidate,
-                    storage_dir=temp_dir,
-                )
+            for content_type in cases:
+                with self.subTest(content_type=content_type):
+                    candidate = attachment("iphone.mp4", content_type, video_data)
+                    with patch.object(
+                        media,
+                        "probe_and_validate_mp4",
+                        new=AsyncMock(),
+                    ) as validate_mp4:
+                        saved, error = await media.save_validated_media_attachment(
+                            candidate,
+                            storage_dir=temp_dir,
+                        )
 
-            self.assertIsNone(error)
-            self.assertEqual(Path(saved).suffix, ".mp4")
-            self.assertEqual(Path(saved).read_bytes(), video_data)
-            validate_mp4.assert_awaited_once()
+                    self.assertIsNone(error)
+                    self.assertEqual(Path(saved).suffix, ".mp4")
+                    self.assertEqual(Path(saved).read_bytes(), video_data)
+                    validate_mp4.assert_awaited_once()
+                    Path(saved).unlink()
 
     async def test_download_failure_removes_temporary_file(self):
         candidate = attachment("image.png", "image/png", b"unused")

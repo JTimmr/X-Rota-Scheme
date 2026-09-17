@@ -464,7 +464,6 @@ class ScheduleComposerTests(unittest.TestCase):
         )
 
         mismatches = (
-            SimpleNamespace(filename="photo.jpg", content_type="image/png"),
             SimpleNamespace(filename="payload.exe", content_type="image/png"),
             SimpleNamespace(filename="photo.png", content_type="video/mp4"),
             SimpleNamespace(filename="photo", content_type=None),
@@ -536,16 +535,6 @@ class ImageStorageTests(unittest.IsolatedAsyncioTestCase):
     async def test_spoofed_or_mismatched_content_is_rejected(self):
         cases = (
             ("payload.png", "image/png", b"MZ executable content"),
-            (
-                "payload.png",
-                "image/png",
-                b"GIF89a content claiming to be PNG",
-            ),
-            (
-                "payload.jpg",
-                "image/png",
-                b"\x89PNG\r\n\x1a\nvalid PNG with mismatched metadata",
-            ),
             (
                 "payload.exe",
                 "image/png",

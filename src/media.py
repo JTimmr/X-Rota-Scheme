@@ -64,6 +64,22 @@ MEDIA_CONTENT_TYPES = {
     "video/quicktime": "mp4",
     "video/x-m4v": "mp4",
 }
+HEIC_EXTENSIONS = {".heic", ".heif"}
+HEIC_CONTENT_TYPES = {"image/heic", "image/heif"}
+# ISO brands used by HEIC/HEIF still images (not MP4 video).
+HEIC_FTYP_BRANDS = {
+    b"heic",
+    b"heix",
+    b"heif",
+    b"heim",
+    b"heis",
+    b"hevc",
+    b"hevx",
+    b"hevm",
+    b"hevs",
+    b"mif1",
+    b"msf1",
+}
 GENERIC_CONTENT_TYPES = {
     "application/octet-stream",
     "binary/octet-stream",
@@ -85,6 +101,15 @@ SUPPORTED_MEDIA_ERROR = (
 MEDIA_MISMATCH_ERROR = (
     "The file name, reported type, and actual contents do not match the same "
     "supported media format. Re-export the file with the correct extension."
+)
+HEIC_ERROR = (
+    "iPhone HEIC/HEIF photos are not supported by X. In the Photos app, share "
+    "the image as JPEG, or set Settings → Camera → Formats → Most Compatible, "
+    "then attach the new file."
+)
+MOV_ERROR = (
+    "This video is QuickTime/MOV, not MP4. On iPhone, set Settings → Camera → "
+    "Formats → Most Compatible, or export it as MP4/H.264, then attach that file."
 )
 MEDIA_SAVE_ERROR = "Failed to download or save the media. Please try again."
 CORRUPT_IMAGE_ERROR = (
@@ -141,13 +166,7 @@ def max_bytes_for_format(media_format: str) -> int:
     return STILL_IMAGE_MAX_BYTES
 
 
-def precheck_media_attachment(attachment: Any) -> str:
-    """Validate advisory filename/MIME/size metadata and return its format."""
-    suffix = Path(getattr(attachment, "filename", "") or "").suffix.lower()
-    filename_format = MEDIA_EXTENSIONS.get(suffix)
-    if suffix and filename_format is None:
-        raise MediaValidationError(SUPPORTED_MEDIA_ERROR)
-
+def _normalized_content_type(attachment: Any) -> str:
     content_type = (
         (getattr(attachment, "content_type", None) or "")
         .partition(";")[0]
@@ -155,17 +174,58 @@ def precheck_media_attachment(attachment: Any) -> str:
         .lower()
     )
     if content_type in GENERIC_CONTENT_TYPES:
-        content_type = ""
-    mime_format = MEDIA_CONTENT_TYPES.get(content_type)
-    if content_type and mime_format is None:
+        return ""
+    return content_type
+
+
+def precheck_media_attachment(attachment: Any) -> str:
+    """Validate advisory filename/MIME/size metadata and return a provisional format.
+
+    Discord iOS often lies about type: camera JPEGs named ``.png``, HEVC MP4s
+    reported as ``video/hevc``, and so on. Filename/MIME are used only to
+    decide whether to download and which size cap to apply. File bytes win.
+    """
+    suffix = Path(getattr(attachment, "filename", "") or "").suffix.lower()
+    content_type = _normalized_content_type(attachment)
+
+    if suffix in HEIC_EXTENSIONS or (
+        content_type in HEIC_CONTENT_TYPES and suffix not in MEDIA_EXTENSIONS
+    ):
+        raise MediaValidationError(HEIC_ERROR)
+
+    filename_format = MEDIA_EXTENSIONS.get(suffix)
+    if suffix and filename_format is None:
         raise MediaValidationError(SUPPORTED_MEDIA_ERROR)
 
-    if filename_format and mime_format and filename_format != mime_format:
+    mime_format = MEDIA_CONTENT_TYPES.get(content_type)
+    # Unknown MIME (video/hevc, image/heic on a .png, etc.) is ignored when the
+    # filename already identifies a supported type. Contents are inspected later.
+    if content_type and mime_format is None:
+        if filename_format is None:
+            if content_type in HEIC_CONTENT_TYPES:
+                raise MediaValidationError(HEIC_ERROR)
+            raise MediaValidationError(SUPPORTED_MEDIA_ERROR)
+        log.info(
+            "Ignoring unrecognized Discord content type %r for attachment %r",
+            content_type,
+            getattr(attachment, "filename", None),
+        )
+        mime_format = None
+
+    if (
+        filename_format
+        and mime_format
+        and filename_format != mime_format
+        and ((filename_format in IMAGE_FORMATS) != (mime_format in IMAGE_FORMATS))
+    ):
         raise MediaValidationError(MEDIA_MISMATCH_ERROR)
 
     expected_format = filename_format or mime_format
     if expected_format is None:
         raise MediaValidationError(SUPPORTED_MEDIA_ERROR)
+
+    candidates = {fmt for fmt in (filename_format, mime_format) if fmt}
+    size_limit = max(max_bytes_for_format(fmt) for fmt in candidates)
 
     reported_size = getattr(attachment, "size", None)
     if reported_size is not None:
@@ -173,13 +233,17 @@ def precheck_media_attachment(attachment: Any) -> str:
             reported_size = int(reported_size)
         except (TypeError, ValueError):
             reported_size = None
-    if (
-        reported_size is not None
-        and reported_size > max_bytes_for_format(expected_format)
-    ):
-        raise MediaValidationError(media_size_error(expected_format))
+    if reported_size is not None and reported_size > size_limit:
+        largest = max(candidates, key=max_bytes_for_format)
+        raise MediaValidationError(media_size_error(largest))
 
     return expected_format
+
+
+def _ftyp_brand(data: bytes) -> bytes | None:
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return data[8:12].lower()
+    return None
 
 
 def detect_media_format(data: bytes) -> str | None:
@@ -192,14 +256,24 @@ def detect_media_format(data: bytes) -> str | None:
         return "gif"
     if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
         return "webp"
-    if (
-        len(data) >= 12
-        and data[4:8] == b"ftyp"
-        and data[8:12].lower() != b"qt  "
-        and not data[8:12].lower().startswith((b"3gp", b"3g2"))
-    ):
-        return "mp4"
-    return None
+    brand = _ftyp_brand(data)
+    if brand is None:
+        return None
+    if brand in HEIC_FTYP_BRANDS:
+        return None
+    if brand == b"qt  " or brand.startswith((b"3gp", b"3g2")):
+        return None
+    return "mp4"
+
+
+def signature_rejection_error(data: bytes) -> str:
+    """Explain why unrecognized bytes are not a supported X media type."""
+    brand = _ftyp_brand(data)
+    if brand in HEIC_FTYP_BRANDS:
+        return HEIC_ERROR
+    if brand == b"qt  ":
+        return MOV_ERROR
+    return MEDIA_MISMATCH_ERROR
 
 
 def detect_image_format(data: bytes) -> str | None:
@@ -635,6 +709,22 @@ async def save_validated_media_attachment(
             temp_path,
             max_bytes_for_format(expected_format),
         )
+        detected_format = await asyncio.to_thread(detect_file_format, temp_path)
+        if detected_format is None:
+            header = await asyncio.to_thread(lambda: temp_path.read_bytes()[:64])
+            raise MediaValidationError(signature_rejection_error(header))
+        if detected_format != expected_format:
+            log.info(
+                "Using detected %s contents for attachment %r "
+                "(Discord metadata said %s)",
+                detected_format,
+                getattr(attachment, "filename", None),
+                expected_format,
+            )
+            actual_size = await asyncio.to_thread(lambda: temp_path.stat().st_size)
+            if actual_size > max_bytes_for_format(detected_format):
+                raise MediaValidationError(media_size_error(detected_format))
+            expected_format = detected_format
         await validate_media_file(temp_path, expected_format)
 
         final_path = directory / (

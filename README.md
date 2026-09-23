@@ -90,9 +90,19 @@ alerts and attempts with no target are not recorded.
 Content and media can be changed before go-live. Replacement media is fully
 validated before the database switches away from the old file; failed
 validation leaves the existing attachment intact. Each scheduled-post card
-also has a **Discord live links** toggle and delay dropdown. These controls
-affect only the configured live-link channels; schedule cards, archive records,
-and reminders remain available.
+also has a **Discord live links** toggle and **Change delay** button. The button
+opens its dropdown ephemerally instead of attaching a select menu to the public
+card. These controls affect only the configured live-link channels; schedule
+cards, archive records, and reminders remain available.
+
+The explicit **Cancel post** button and confirmation soft-cancel a post: its
+claims, availability, media reference, and settings remain in SQLite. A
+cancellation record is sent to the archive channel with a persistent
+**Reschedule** button. Rescheduling keeps the cancellation history, restores
+the same post with the selected time, and clears old pre-live alert dedupe
+records so the new schedule receives its own alerts. Raw message deletions are
+never treated as cancellation because Discord does not identify whether a user,
+moderator, or security bot deleted the card.
 
 ## CTO X role rota
 

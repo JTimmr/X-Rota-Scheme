@@ -437,14 +437,22 @@ class ScheduledEditMentionSafetyTests(unittest.IsolatedAsyncioTestCase):
             if isinstance(item, discord.ui.Button)
             and item.custom_id == "postdiscord:1"
         )
-        delay_select = next(
+        delay_button = next(
             item
             for item in off_view.children
-            if isinstance(item, discord.ui.Select)
-            and item.custom_id == "discorddelay:1"
+            if isinstance(item, discord.ui.Button)
+            and item.custom_id == "changedelay:1"
+        )
+        cancel_button = next(
+            item
+            for item in off_view.children
+            if isinstance(item, discord.ui.Button)
+            and item.custom_id == "cancelpost:1"
         )
         self.assertIn("off", discord_button.label)
-        self.assertTrue(delay_select.disabled)
+        self.assertTrue(delay_button.disabled)
+        self.assertEqual(delay_button.label, "Change delay")
+        self.assertEqual(cancel_button.label, "Cancel post")
 
         post = {
             "id": 1,
@@ -458,6 +466,7 @@ class ScheduledEditMentionSafetyTests(unittest.IsolatedAsyncioTestCase):
             "discord_delay_minutes": 0,
         }
         delayed = {**post, "discord_delay_minutes": 60}
+        schedule_message = SimpleNamespace(edit=AsyncMock())
         interaction = SimpleNamespace(
             data={"values": ["60"]},
             user=SimpleNamespace(id=999),
@@ -465,6 +474,7 @@ class ScheduledEditMentionSafetyTests(unittest.IsolatedAsyncioTestCase):
                 edit_message=AsyncMock(),
                 send_message=AsyncMock(),
             ),
+            message=SimpleNamespace(),
         )
         update = AsyncMock(return_value=True)
         with (
@@ -489,13 +499,16 @@ class ScheduledEditMentionSafetyTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=[]),
             ),
         ):
-            await schedule.PostButtonView(
+            await schedule.DiscordDelayPickerView(
                 bot,
                 post_id=1,
-            )._on_discord_delay(interaction)
+                user_id=999,
+                schedule_message=schedule_message,
+                current_delay_minutes=0,
+            )._on_select(interaction)
 
         update.assert_awaited_once_with(1, True, 60)
-        edited = interaction.response.edit_message.await_args
+        edited = schedule_message.edit.await_args
         self.assertIn("1 hour", edited.kwargs["content"])
 
 

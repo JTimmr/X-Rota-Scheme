@@ -2,7 +2,8 @@
 
 These are publish-lifecycle issues. They are independent of For You strategy and independent of the later content backfill. Fixing them makes experiments trustworthy: you cannot learn from a slot if you are unsure whether X accepted it or whether Discord side effects ran.
 
-Verification while this was written: `python -m unittest discover -s tests -v` (133 tests) and `python -m compileall -q src tests` both passed.
+Verification while this was written: `python -m pytest -q` (140 tests) and
+`python -m compileall -q src tests` both passed.
 
 ## What already works
 
@@ -14,6 +15,8 @@ Verification while this was written: `python -m unittest discover -s tests -v` (
 - Manual-X path that skips the X API and live-link channels.
 - Per-post live-link disable/delay controls with persisted, per-channel delivery retries.
 - Confirmed X publication time stored for successful automatic posts.
+- Explicit soft cancellation with an archived, restart-safe reschedule control;
+  raw message deletions cannot cancel posts.
 
 ## Problems that affect pipeline experiments
 

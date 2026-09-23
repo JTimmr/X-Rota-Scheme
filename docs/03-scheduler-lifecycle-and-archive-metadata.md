@@ -29,6 +29,7 @@ Related tables that can exist before go-live:
 - `unavailable` — who opted out of fallback pings
 - `post_alert_deliveries` — whether the 4h unclaimed and/or 15m pre-live alerts already sent
 - `post_discord_deliveries` — one persisted live-link delivery per configured channel, including due time, attempts, Discord message ID, and delivery time
+- `post_cancellations` — cancellation time, the schedule time that was cancelled, cancellation archive-message ID, and any later reschedule actor/time
 
 ## What changes at go-live
 
@@ -52,6 +53,14 @@ Nothing else on the row is updated. In particular the bot does **not** store:
 
 Claims, unavailable rows, and alert-delivery rows are left in place. They are not copied into the archive message.
 
+## What changes at cancellation
+
+The scheduled card's explicit **Cancel post** button and confirmation change the `posts.status` value from `scheduled` to `cancelled`; they do not delete the row. The bot inserts a `post_cancellations` event and sends the content, media, original schedule time, scheduler, and cancellation time to the archive channel with a persistent **Reschedule** button. The cancellation archive-message ID is stored so the button can be restored after a restart.
+
+Rescheduling changes the same post back to `scheduled` with its new time while retaining the cancellation event. Claims, unavailable users, content, media, and delivery settings stay attached. Previous pre-live alert-delivery records are cleared so alerts can run against the new time. The cancellation archive message is updated with the new time and rescheduler.
+
+Raw Discord deletion events are never cancellation commands because they do not identify the actor. A moderator or security bot deleting a card therefore leaves its database row scheduled. The refresh process also records its own deleted message IDs to avoid misleading warnings.
+
 ## What the Discord archive message contains
 
 This is the human-readable archive, not a database snapshot. Text roughly includes:
@@ -64,7 +73,7 @@ This is the human-readable archive, not a database snapshot. Text roughly includ
 - an embed whose description is `content` (truncated at Discord's 4,096-character embed limit)
 - the media file re-uploaded from `image_path` if the file still exists
 
-The archive message does **not** list claimers, unavailable users, `skip_unclaimed_pings`, `post_to_x` as a field (except indirectly via the heading), alert history, or SQLite `id`.
+Go-live archive messages do **not** list claimers, unavailable users, `skip_unclaimed_pings`, `post_to_x` as a field (except indirectly via the heading), alert history, or SQLite `id`.
 
 ## Side effects that are not metadata
 

@@ -253,5 +253,100 @@ class DiscordDeliveryPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 database.IMAGES_DIR = original_images_dir
 
 
+class CancellationPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancel_archives_and_reschedules_without_deleting_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_db_path = database.DB_PATH
+            original_images_dir = database.IMAGES_DIR
+            database.DB_PATH = Path(temp_dir) / "rota.db"
+            database.IMAGES_DIR = Path(temp_dir) / "images"
+            try:
+                await database.init_db()
+                post_id = await database.insert_post(
+                    discord_message_id="500",
+                    content="Recoverable post",
+                    scheduled_at=2_000,
+                    created_by="42",
+                )
+                await database.add_claim(post_id, "7")
+                await database.add_unavailable(post_id, "8")
+                await database.record_post_alert_delivery(post_id, "4h")
+
+                cancellation = (
+                    await database.cancel_scheduled_post_by_message_id(
+                        "500",
+                        1_000,
+                    )
+                )
+
+                self.assertIsNotNone(cancellation)
+                cancellation_id = cancellation["cancellation_id"]
+                post = await database.get_post_by_id(post_id)
+                self.assertEqual(post["status"], "cancelled")
+                self.assertEqual(
+                    await database.get_claimers_for_post(post_id),
+                    ["7"],
+                )
+                self.assertEqual(
+                    await database.get_unavailable_for_post(post_id),
+                    ["8"],
+                )
+                async with aiosqlite.connect(database.DB_PATH) as db:
+                    cursor = await db.execute("SELECT COUNT(*) FROM posts")
+                    self.assertEqual((await cursor.fetchone())[0], 1)
+
+                self.assertTrue(
+                    await database.record_cancellation_archive_message(
+                        cancellation_id,
+                        "900",
+                    )
+                )
+                open_cancellations = (
+                    await database.get_open_cancellations_with_archive()
+                )
+                self.assertEqual(len(open_cancellations), 1)
+                self.assertEqual(
+                    open_cancellations[0]["cancelled_scheduled_at"],
+                    2_000,
+                )
+
+                self.assertTrue(
+                    await database.reschedule_cancelled_post(
+                        cancellation_id,
+                        3_000,
+                        "99",
+                        1_100,
+                    )
+                )
+                self.assertFalse(
+                    await database.reschedule_cancelled_post(
+                        cancellation_id,
+                        4_000,
+                        "99",
+                        1_200,
+                    )
+                )
+
+                post = await database.get_post_by_id(post_id)
+                self.assertEqual(post["status"], "scheduled")
+                self.assertEqual(post["scheduled_at"], 3_000)
+                self.assertFalse(
+                    await database.was_post_alert_delivered(post_id, "4h")
+                )
+                cancellation = await database.get_cancellation_with_post(
+                    cancellation_id
+                )
+                self.assertEqual(cancellation["rescheduled_at"], 1_100)
+                self.assertEqual(cancellation["rescheduled_by"], "99")
+                self.assertEqual(cancellation["cancelled_scheduled_at"], 2_000)
+                self.assertEqual(
+                    await database.get_open_cancellations_with_archive(),
+                    [],
+                )
+            finally:
+                database.DB_PATH = original_db_path
+                database.IMAGES_DIR = original_images_dir
+
+
 if __name__ == "__main__":
     unittest.main()

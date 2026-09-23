@@ -74,8 +74,24 @@ async def init_db():
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS post_cancellations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_id INTEGER NOT NULL,
+                cancelled_at INTEGER NOT NULL,
+                scheduled_at INTEGER NOT NULL,
+                archive_message_id TEXT,
+                rescheduled_at INTEGER,
+                rescheduled_by TEXT,
+                FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE
+            )
+        """)
+        await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_post_discord_deliveries_due
             ON post_discord_deliveries (delivered_at, due_at)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_post_cancellations_open
+            ON post_cancellations (rescheduled_at, archive_message_id)
         """)
         await db.commit()
 
@@ -182,11 +198,219 @@ async def insert_post(
         return cursor.lastrowid
 
 
-async def delete_post_by_message_id(discord_message_id: str):
+async def cancel_scheduled_post_by_message_id(
+    discord_message_id: str,
+    cancelled_at: int,
+) -> dict | None:
+    """Soft-cancel one scheduled post and retain its complete related history."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA foreign_keys = ON")
-        await db.execute("DELETE FROM posts WHERE discord_message_id = ?", (str(discord_message_id),))
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            """
+            SELECT *
+            FROM posts
+            WHERE discord_message_id = ?
+              AND status = 'scheduled'
+            """,
+            (str(discord_message_id),),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            await db.rollback()
+            return None
+
+        post = dict(row)
+        cursor = await db.execute(
+            """
+            UPDATE posts
+            SET status = 'cancelled'
+            WHERE id = ?
+              AND discord_message_id = ?
+              AND status = 'scheduled'
+            """,
+            (post["id"], str(discord_message_id)),
+        )
+        if cursor.rowcount != 1:
+            await db.rollback()
+            return None
+
+        cursor = await db.execute(
+            """
+            INSERT INTO post_cancellations (
+                post_id, cancelled_at, scheduled_at
+            ) VALUES (?, ?, ?)
+            """,
+            (post["id"], cancelled_at, post["scheduled_at"]),
+        )
         await db.commit()
+        post["status"] = "cancelled"
+        post["cancellation_id"] = cursor.lastrowid
+        post["cancelled_at"] = cancelled_at
+        post["cancelled_scheduled_at"] = post["scheduled_at"]
+        post["cancellation_archive_message_id"] = None
+        post["rescheduled_at"] = None
+        post["rescheduled_by"] = None
+        return post
+
+
+async def get_cancellation_with_post(cancellation_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                p.*,
+                c.id AS cancellation_id,
+                c.cancelled_at,
+                c.scheduled_at AS cancelled_scheduled_at,
+                c.archive_message_id AS cancellation_archive_message_id,
+                c.rescheduled_at,
+                c.rescheduled_by
+            FROM post_cancellations c
+            JOIN posts p ON p.id = c.post_id
+            WHERE c.id = ?
+            """,
+            (cancellation_id,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_cancellations_pending_archive() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                p.*,
+                c.id AS cancellation_id,
+                c.cancelled_at,
+                c.scheduled_at AS cancelled_scheduled_at,
+                c.archive_message_id AS cancellation_archive_message_id,
+                c.rescheduled_at,
+                c.rescheduled_by
+            FROM post_cancellations c
+            JOIN posts p ON p.id = c.post_id
+            WHERE c.archive_message_id IS NULL
+            ORDER BY c.cancelled_at, c.id
+            """
+        )
+        return [dict(row) async for row in cursor]
+
+
+async def get_open_cancellations_with_archive() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                p.*,
+                c.id AS cancellation_id,
+                c.cancelled_at,
+                c.scheduled_at AS cancelled_scheduled_at,
+                c.archive_message_id AS cancellation_archive_message_id,
+                c.rescheduled_at,
+                c.rescheduled_by
+            FROM post_cancellations c
+            JOIN posts p ON p.id = c.post_id
+            WHERE c.archive_message_id IS NOT NULL
+              AND c.rescheduled_at IS NULL
+              AND p.status = 'cancelled'
+            ORDER BY c.cancelled_at, c.id
+            """
+        )
+        return [dict(row) async for row in cursor]
+
+
+async def record_cancellation_archive_message(
+    cancellation_id: int,
+    archive_message_id: str,
+) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            UPDATE post_cancellations
+            SET archive_message_id = ?
+            WHERE id = ?
+              AND archive_message_id IS NULL
+            """,
+            (str(archive_message_id), cancellation_id),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def reschedule_cancelled_post(
+    cancellation_id: int,
+    scheduled_at: int,
+    rescheduled_by: str,
+    rescheduled_at: int,
+) -> bool:
+    """Restore a cancelled post while preserving its cancellation event."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA foreign_keys = ON")
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            """
+            SELECT c.post_id
+            FROM post_cancellations c
+            JOIN posts p ON p.id = c.post_id
+            WHERE c.id = ?
+              AND c.rescheduled_at IS NULL
+              AND p.status = 'cancelled'
+            """,
+            (cancellation_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            await db.rollback()
+            return False
+
+        post_id = row["post_id"]
+        cursor = await db.execute(
+            """
+            UPDATE posts
+            SET status = 'scheduled',
+                scheduled_at = ?,
+                discord_message_id = ?
+            WHERE id = ?
+              AND status = 'cancelled'
+            """,
+            (
+                scheduled_at,
+                f"rescheduling_{post_id}_{rescheduled_at}",
+                post_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            await db.rollback()
+            return False
+
+        cursor = await db.execute(
+            """
+            UPDATE post_cancellations
+            SET rescheduled_at = ?,
+                rescheduled_by = ?
+            WHERE id = ?
+              AND rescheduled_at IS NULL
+            """,
+            (rescheduled_at, str(rescheduled_by), cancellation_id),
+        )
+        if cursor.rowcount != 1:
+            await db.rollback()
+            return False
+
+        # Alert deliveries from the previous time must not suppress alerts for
+        # the newly selected schedule.
+        await db.execute(
+            "DELETE FROM post_alert_deliveries WHERE post_id = ?",
+            (post_id,),
+        )
+        await db.commit()
+        return True
 
 
 async def delete_post_by_id(post_id: int):

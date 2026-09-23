@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -11,20 +12,25 @@ from discord import app_commands
 from discord.ext import commands
 
 import media as media_utils
-from config import SCHEDULED_CHANNEL_ID
+from config import ARCHIVE_CHANNEL_ID, SCHEDULED_CHANNEL_ID
 from database import (
     IMAGES_DIR,
     add_claim,
     add_unavailable,
-    delete_post_by_message_id,
+    cancel_scheduled_post_by_message_id,
+    get_cancellations_pending_archive,
     get_all_scheduled_posts,
+    get_cancellation_with_post,
     get_claimers_for_post,
+    get_open_cancellations_with_archive,
     get_post_by_id,
     get_post_by_message_id,
     get_unavailable_for_post,
     insert_post,
+    record_cancellation_archive_message,
     remove_claim,
     remove_unavailable,
+    reschedule_cancelled_post,
     update_post_content,
     update_post_image,
     update_post_message_id,
@@ -658,6 +664,38 @@ def get_discord_file(media_path: str | None) -> discord.File | None:
     return None
 
 
+def format_cancelled_archive_message(cancellation: dict) -> str:
+    lines = [
+        f"**Scheduled post cancelled** <t:{cancellation['cancelled_at']}:F>",
+        "",
+        (
+            "Originally scheduled for: "
+            f"<t:{cancellation['cancelled_scheduled_at']}:F>"
+        ),
+        f"Scheduled by: <@{cancellation['created_by']}>",
+    ]
+    if cancellation.get("rescheduled_at"):
+        lines.extend(
+            [
+                "",
+                (
+                    f"**Rescheduled for:** <t:{cancellation['scheduled_at']}:F> "
+                    f"(<t:{cancellation['scheduled_at']}:R>)"
+                ),
+                f"Rescheduled by: <@{cancellation['rescheduled_by']}>",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _get_internal_deleted_message_ids(bot: commands.Bot) -> set[str]:
+    message_ids = vars(bot).get("_rota_internal_deleted_message_ids")
+    if message_ids is None:
+        message_ids = set()
+        vars(bot)["_rota_internal_deleted_message_ids"] = message_ids
+    return message_ids
+
+
 def precheck_media_attachment(attachment: discord.Attachment) -> str:
     return media_utils.precheck_media_attachment(attachment)
 
@@ -767,6 +805,134 @@ class EditTimeView(_TimePickerView):
         await self._on_minute_select(interaction)
 
 
+class RescheduleCancelledView(_TimePickerView):
+    """Pick a new time while retaining the original cancellation record."""
+
+    def __init__(
+        self,
+        bot: commands.Bot,
+        cancellation_id: int,
+        user_id: int,
+        archive_message,
+    ):
+        self.bot = bot
+        self.cancellation_id = cancellation_id
+        self.user_id = user_id
+        self.archive_message = archive_message
+        suffix = str(cancellation_id)
+        super().__init__(
+            {
+                "timezone_select": f"rc_tz_select:{suffix}",
+                "timezone_button": f"rc_tz_button:{suffix}",
+                "day": f"rc_day:{suffix}",
+                "hour": f"rc_hour:{suffix}",
+                "minute": f"rc_minute:{suffix}",
+                "exact": f"rc_exact_time:{suffix}",
+            }
+        )
+
+    def _status_text(self) -> str:
+        return f"**Pick a new time for the cancelled post:**\n{self._selection_status()}"
+
+    async def _finalize_time(
+        self,
+        interaction: discord.Interaction,
+        unix_ts: int,
+        local_dt: datetime,
+    ):
+        rescheduled_at = int(time.time())
+        updated = await reschedule_cancelled_post(
+            self.cancellation_id,
+            unix_ts,
+            str(interaction.user.id),
+            rescheduled_at,
+        )
+        if not updated:
+            await interaction.response.edit_message(
+                content="This cancellation has already been rescheduled.",
+                view=None,
+            )
+            self.stop()
+            return
+
+        await interaction.response.edit_message(
+            content=(
+                f"Post rescheduled for <t:{unix_ts}:F> (<t:{unix_ts}:R>). "
+                "Refreshing the schedule..."
+            ),
+            view=None,
+        )
+
+        cancellation = await get_cancellation_with_post(self.cancellation_id)
+        if cancellation and self.archive_message is not None:
+            try:
+                await self.archive_message.edit(
+                    content=format_cancelled_archive_message(cancellation),
+                    view=None,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+                log.exception(
+                    "Post %s was rescheduled but cancellation archive message "
+                    "could not be updated",
+                    cancellation["id"],
+                )
+
+        await repost_all_scheduled(self.bot)
+        self.stop()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Only the person who started this reschedule can use it.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+
+class CancelledPostView(discord.ui.View):
+    """Persistent archive control for restoring a cancelled scheduled post."""
+
+    def __init__(self, bot: commands.Bot, cancellation_id: int):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.cancellation_id = cancellation_id
+        button = discord.ui.Button(
+            label="Reschedule",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"reschedule_cancelled:{cancellation_id}",
+        )
+        button.callback = self._on_reschedule
+        self.add_item(button)
+
+    async def _on_reschedule(self, interaction: discord.Interaction):
+        cancellation = await get_cancellation_with_post(self.cancellation_id)
+        if (
+            cancellation is None
+            or cancellation.get("rescheduled_at") is not None
+            or cancellation.get("status") != "cancelled"
+        ):
+            await interaction.response.send_message(
+                "This cancellation has already been rescheduled.",
+                ephemeral=True,
+            )
+            return
+
+        view = RescheduleCancelledView(
+            self.bot,
+            self.cancellation_id,
+            interaction.user.id,
+            interaction.message,
+        )
+        await interaction.response.send_message(
+            view._status_text(),
+            view=view,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
 class EditMediaView(discord.ui.View):
     """Shown after clicking 'Change media'. Offers remove or replace."""
 
@@ -811,6 +977,238 @@ class EditMediaView(discord.ui.View):
 # ---------------------------------------------------------------------------
 # Main post buttons (Claim, Not available, Change time/content/media)
 # ---------------------------------------------------------------------------
+
+async def _scheduled_post_message_payload(
+    bot: commands.Bot,
+    post_id: int,
+) -> dict | None:
+    post = await get_post_by_id(post_id)
+    if not post or post.get("status", "scheduled") != "scheduled":
+        return None
+
+    claimers = await get_claimers_for_post(post_id)
+    unavailable = await get_unavailable_for_post(post_id)
+    skip_pings = bool(post.get("skip_unclaimed_pings"))
+    post_to_x = bool(post.get("post_to_x", 1))
+    post_to_discord = bool(post.get("post_to_discord", 1))
+    discord_delay_minutes = int(post.get("discord_delay_minutes", 0))
+    return {
+        "content": format_scheduled_message(
+            post["content"],
+            post["scheduled_at"],
+            post["created_by"],
+            claimers,
+            unavailable,
+            skip_unclaimed_pings=skip_pings,
+            post_to_x=post_to_x,
+            post_to_discord=post_to_discord,
+            discord_delay_minutes=discord_delay_minutes,
+        ),
+        "embed": build_post_embed(post["content"]),
+        "view": PostButtonView(
+            bot,
+            post_id,
+            skip_unclaimed_pings=skip_pings,
+            post_to_discord=post_to_discord,
+            discord_delay_minutes=discord_delay_minutes,
+        ),
+        "allowed_mentions": discord.AllowedMentions.none(),
+    }
+
+
+class CancelPostConfirmationView(discord.ui.View):
+    """Require an explicit confirmation instead of treating deletion as cancel."""
+
+    def __init__(
+        self,
+        bot: commands.Bot,
+        post_id: int,
+        user_id: int,
+        schedule_message,
+    ):
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.post_id = post_id
+        self.user_id = user_id
+        self.schedule_message = schedule_message
+
+        confirm = discord.ui.Button(
+            label="Confirm cancellation",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"confirm_cancel:{post_id}",
+        )
+        confirm.callback = self._on_confirm
+        self.add_item(confirm)
+
+        keep = discord.ui.Button(
+            label="Keep scheduled",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"keep_scheduled:{post_id}",
+        )
+        keep.callback = self._on_keep
+        self.add_item(keep)
+
+    async def _on_confirm(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        async with get_schedule_refresh_lock(self.bot):
+            post = await get_post_by_id(self.post_id)
+            cancellation = None
+            if post and post.get("status") == "scheduled":
+                cancellation = await cancel_scheduled_post_by_message_id(
+                    str(post["discord_message_id"]),
+                    int(time.time()),
+                )
+
+        if cancellation is None:
+            await interaction.edit_original_response(
+                content="This post is no longer scheduled.",
+                view=None,
+            )
+            self.stop()
+            return
+
+        archived = await archive_cancellation(self.bot, cancellation)
+        if self.schedule_message is not None:
+            message_id = str(self.schedule_message.id)
+            internal_deletions = _get_internal_deleted_message_ids(self.bot)
+            internal_deletions.add(message_id)
+            try:
+                await self.schedule_message.delete()
+            except discord.NotFound:
+                internal_deletions.discard(message_id)
+            except (discord.Forbidden, discord.HTTPException):
+                internal_deletions.discard(message_id)
+                log.exception(
+                    "Post %s was cancelled but its schedule card could not be deleted",
+                    self.post_id,
+                )
+
+        await interaction.edit_original_response(
+            content=(
+                "Post cancelled and moved to the archive."
+                if archived
+                else (
+                    "Post cancelled. The archive channel was unavailable; "
+                    "the bot will retry archiving after restart."
+                )
+            ),
+            view=None,
+        )
+        log.info(
+            "Post %s explicitly cancelled by %s (archived=%s)",
+            self.post_id,
+            interaction.user.id,
+            archived,
+        )
+        self.stop()
+
+    async def _on_keep(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content="Cancellation aborted; the post remains scheduled.",
+            view=None,
+        )
+        self.stop()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Only the person who opened this confirmation can use it.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+
+class DiscordDelayPickerView(discord.ui.View):
+    """Ephemeral delay picker kept off the public scheduled-post card."""
+
+    def __init__(
+        self,
+        bot: commands.Bot,
+        post_id: int,
+        user_id: int,
+        schedule_message,
+        current_delay_minutes: int,
+    ):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.post_id = post_id
+        self.user_id = user_id
+        self.schedule_message = schedule_message
+
+        select = discord.ui.Select(
+            placeholder=(
+                f"Current delay: {_format_discord_delay(current_delay_minutes)}"
+            ),
+            custom_id=f"setdiscorddelay:{post_id}",
+        )
+        for label, minutes in DISCORD_DELAY_CHOICES:
+            select.add_option(
+                label=label,
+                value=str(minutes),
+                default=(current_delay_minutes == minutes),
+            )
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        delay_minutes = int(interaction.data["values"][0])
+        async with get_schedule_refresh_lock(self.bot):
+            post = await get_post_by_id(self.post_id)
+            if not post or post.get("status", "scheduled") != "scheduled":
+                await interaction.response.edit_message(
+                    content="This post is no longer scheduled.",
+                    view=None,
+                )
+                self.stop()
+                return
+            updated = await update_scheduled_post_discord_settings(
+                self.post_id,
+                bool(post.get("post_to_discord", 1)),
+                delay_minutes,
+            )
+
+        if not updated:
+            await interaction.response.edit_message(
+                content="This post is no longer scheduled.",
+                view=None,
+            )
+            self.stop()
+            return
+
+        await interaction.response.edit_message(
+            content=(
+                "Discord live-link delay updated to "
+                f"**{_format_discord_delay(delay_minutes)}**."
+            ),
+            view=None,
+        )
+        payload = await _scheduled_post_message_payload(self.bot, self.post_id)
+        if payload and self.schedule_message is not None:
+            try:
+                await self.schedule_message.edit(**payload)
+            except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+                log.exception(
+                    "Post %s delay changed but its schedule card could not be updated",
+                    self.post_id,
+                )
+        log.info(
+            "Post %s discord_delay_minutes=%s (by %s)",
+            self.post_id,
+            delay_minutes,
+            interaction.user.id,
+        )
+        self.stop()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Only the person who opened this delay menu can use it.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
 
 class PostButtonView(discord.ui.View):
     """Buttons attached to each scheduled post message."""
@@ -879,6 +1277,15 @@ class PostButtonView(discord.ui.View):
         ping_btn.callback = self._on_toggle_skip_unclaimed_pings
         self.add_item(ping_btn)
 
+        cancel_btn = discord.ui.Button(
+            label="Cancel post",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"cancelpost:{post_id}",
+            row=2,
+        )
+        cancel_btn.callback = self._on_cancel
+        self.add_item(cancel_btn)
+
         discord_btn = discord.ui.Button(
             label=(
                 "Discord live links: on"
@@ -896,29 +1303,15 @@ class PostButtonView(discord.ui.View):
         discord_btn.callback = self._on_toggle_post_to_discord
         self.add_item(discord_btn)
 
-        delay_select = discord.ui.Select(
-            placeholder=(
-                f"Discord delay: {_format_discord_delay(discord_delay_minutes)}"
-            ),
-            custom_id=f"discorddelay:{post_id}",
+        delay_btn = discord.ui.Button(
+            label="Change delay",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"changedelay:{post_id}",
             row=4,
             disabled=not post_to_discord,
         )
-        choice_values = {minutes for _, minutes in DISCORD_DELAY_CHOICES}
-        if discord_delay_minutes not in choice_values:
-            delay_select.add_option(
-                label=f"Current: {_format_discord_delay(discord_delay_minutes)}",
-                value=str(discord_delay_minutes),
-                default=True,
-            )
-        for label, minutes in DISCORD_DELAY_CHOICES:
-            delay_select.add_option(
-                label=label,
-                value=str(minutes),
-                default=(discord_delay_minutes == minutes),
-            )
-        delay_select.callback = self._on_discord_delay
-        self.add_item(delay_select)
+        delay_btn.callback = self._on_change_discord_delay
+        self.add_item(delay_btn)
 
     async def _on_claim(self, interaction: discord.Interaction):
         uid = str(interaction.user.id)
@@ -940,6 +1333,25 @@ class PostButtonView(discord.ui.View):
         await update_post_skip_unclaimed_pings(self.post_id, new_val)
         log.info(f"Post {self.post_id} skip_unclaimed_pings={new_val} (by {interaction.user.id})")
         await self._update_message(interaction)
+
+    async def _on_cancel(self, interaction: discord.Interaction):
+        post = await get_post_by_id(self.post_id)
+        if not post or post.get("status") != "scheduled":
+            await interaction.response.send_message(
+                "This post is no longer scheduled.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "Cancel this post and move it to the archive?",
+            view=CancelPostConfirmationView(
+                self.bot,
+                self.post_id,
+                interaction.user.id,
+                interaction.message,
+            ),
+            ephemeral=True,
+        )
 
     async def _on_toggle_post_to_discord(
         self,
@@ -973,34 +1385,34 @@ class PostButtonView(discord.ui.View):
         )
         await self._update_message(interaction)
 
-    async def _on_discord_delay(self, interaction: discord.Interaction):
-        delay_minutes = int(interaction.data["values"][0])
-        async with get_schedule_refresh_lock(self.bot):
-            post = await get_post_by_id(self.post_id)
-            if not post or post.get("status", "scheduled") != "scheduled":
-                await interaction.response.send_message(
-                    "This post is no longer scheduled.",
-                    ephemeral=True,
-                )
-                return
-            updated = await update_scheduled_post_discord_settings(
-                self.post_id,
-                bool(post.get("post_to_discord", 1)),
-                delay_minutes,
-            )
-        if not updated:
+    async def _on_change_discord_delay(
+        self,
+        interaction: discord.Interaction,
+    ):
+        post = await get_post_by_id(self.post_id)
+        if not post or post.get("status", "scheduled") != "scheduled":
             await interaction.response.send_message(
                 "This post is no longer scheduled.",
                 ephemeral=True,
             )
             return
-        log.info(
-            "Post %s discord_delay_minutes=%s (by %s)",
-            self.post_id,
-            delay_minutes,
-            interaction.user.id,
+
+        current_delay = int(post.get("discord_delay_minutes", 0))
+        await interaction.response.send_message(
+            (
+                "Choose when successful X links should be sent to the "
+                "configured Discord live-link channels."
+            ),
+            view=DiscordDelayPickerView(
+                self.bot,
+                self.post_id,
+                interaction.user.id,
+                interaction.message,
+                current_delay,
+            ),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
-        await self._update_message(interaction)
 
     async def _on_unavailable(self, interaction: discord.Interaction):
         uid = str(interaction.user.id)
@@ -1122,6 +1534,70 @@ class SchedulePanelView(discord.ui.View):
         )
 
 
+async def archive_cancellation(bot: commands.Bot, cancellation: dict) -> bool:
+    """Post one durable cancellation record with a reschedule control."""
+    if cancellation.get("cancellation_archive_message_id"):
+        return True
+
+    channel = bot.get_channel(ARCHIVE_CHANNEL_ID)
+    if channel is None:
+        log.warning(
+            "Cancellation %s could not be archived: channel %s was not found",
+            cancellation["cancellation_id"],
+            ARCHIVE_CHANNEL_ID,
+        )
+        return False
+
+    view = None
+    if (
+        cancellation.get("rescheduled_at") is None
+        and cancellation.get("status") == "cancelled"
+    ):
+        view = CancelledPostView(bot, cancellation["cancellation_id"])
+
+    send_kwargs = {
+        "embed": build_post_embed(cancellation["content"]),
+        "view": view,
+        "allowed_mentions": discord.AllowedMentions.none(),
+    }
+    file = get_discord_file(cancellation.get("image_path"))
+    if file is not None:
+        send_kwargs["file"] = file
+
+    try:
+        message = await channel.send(
+            format_cancelled_archive_message(cancellation),
+            **send_kwargs,
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        log.exception(
+            "Failed to archive cancellation %s",
+            cancellation["cancellation_id"],
+        )
+        return False
+
+    recorded = await record_cancellation_archive_message(
+        cancellation["cancellation_id"],
+        str(message.id),
+    )
+    if not recorded:
+        log.warning(
+            "Cancellation %s archive message %s was sent but not recorded",
+            cancellation["cancellation_id"],
+            message.id,
+        )
+        return False
+    return True
+
+
+async def archive_pending_cancellations(bot: commands.Bot) -> bool:
+    success = True
+    for cancellation in await get_cancellations_pending_archive():
+        if not await archive_cancellation(bot, cancellation):
+            success = False
+    return success
+
+
 async def send_schedule_panel(channel, bot: commands.Bot) -> discord.Message | None:
     """Send one scheduling panel to the configured scheduled channel."""
     channel_id = getattr(channel, "id", None)
@@ -1180,12 +1656,18 @@ async def repost_all_scheduled(bot: commands.Bot) -> bool:
                 )
 
             stage = "deleting existing bot messages"
+            internal_deletions = _get_internal_deleted_message_ids(bot)
             async for msg in channel.history(limit=500):
                 if msg.author == bot.user:
+                    message_id = str(msg.id)
+                    internal_deletions.add(message_id)
                     try:
                         await msg.delete()
                     except discord.NotFound:
-                        pass
+                        internal_deletions.discard(message_id)
+                    except Exception:
+                        internal_deletions.discard(message_id)
+                        raise
 
             stage = "sending scheduled post messages"
             for post in posts:
@@ -1568,6 +2050,21 @@ class ScheduleCog(commands.Cog):
 
     async def cog_load(self):
         self.bot.add_view(SchedulePanelView(self.bot))
+        for cancellation in await get_open_cancellations_with_archive():
+            message_id = cancellation["cancellation_archive_message_id"]
+            try:
+                numeric_message_id = int(message_id)
+            except (TypeError, ValueError):
+                log.error(
+                    "Cancellation %s has invalid archive message ID %r",
+                    cancellation["cancellation_id"],
+                    message_id,
+                )
+                continue
+            self.bot.add_view(
+                CancelledPostView(self.bot, cancellation["cancellation_id"]),
+                message_id=numeric_message_id,
+            )
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -1578,6 +2075,7 @@ class ScheduleCog(commands.Cog):
         try:
             if await repost_all_scheduled(self.bot):
                 self._startup_done = True
+                await archive_pending_cancellations(self.bot)
                 return
 
             log.warning(
@@ -1587,6 +2085,7 @@ class ScheduleCog(commands.Cog):
             await asyncio.sleep(STARTUP_REFRESH_RETRY_SECONDS)
             if await repost_all_scheduled(self.bot):
                 self._startup_done = True
+                await archive_pending_cancellations(self.bot)
             else:
                 log.error(
                     "Startup schedule refresh failed after one retry; "
@@ -1687,16 +2186,25 @@ class ScheduleCog(commands.Cog):
         if payload.channel_id != SCHEDULED_CHANNEL_ID:
             return
 
-        post = await get_post_by_message_id(str(payload.message_id))
-        if not post:
-            return
-        if post["status"] != "scheduled":
+        message_id = str(payload.message_id)
+        internal_deletions = _get_internal_deleted_message_ids(self.bot)
+        if message_id in internal_deletions:
+            internal_deletions.discard(message_id)
+            log.debug("Ignored internal deletion of schedule message %s", message_id)
             return
 
-        await delete_post_by_message_id(str(payload.message_id))
-        log.info(f"Cancelled post {post['id']} (message {payload.message_id} was deleted)")
+        post = await get_post_by_message_id(message_id)
+        if post is None or post.get("status") != "scheduled":
+            return
 
-        await repost_all_scheduled(self.bot)
+        # Raw deletion events do not identify the actor. A moderator/security
+        # bot deleting a card must never be interpreted as user cancellation.
+        log.warning(
+            "Schedule message %s for post %s was deleted externally; "
+            "the database row remains scheduled",
+            payload.message_id,
+            post["id"],
+        )
 
 
 class MediaPostPicker(discord.ui.View):

@@ -105,12 +105,40 @@ class SchedulePanelTests(unittest.IsolatedAsyncioTestCase):
         bot = Mock()
         cog = schedule.ScheduleCog(bot)
 
-        await cog.cog_load()
+        with patch.object(
+            schedule,
+            "get_open_cancellations_with_archive",
+            new=AsyncMock(return_value=[]),
+        ):
+            await cog.cog_load()
 
         bot.add_view.assert_called_once()
         registered_view = bot.add_view.call_args.args[0]
         self.assertIsInstance(registered_view, schedule.SchedulePanelView)
         self.assertTrue(registered_view.is_persistent())
+
+    async def test_cog_load_restores_open_cancellation_reschedule_button(self):
+        bot = Mock()
+        cog = schedule.ScheduleCog(bot)
+        cancellation = {
+            "cancellation_id": 12,
+            "cancellation_archive_message_id": "700",
+        }
+
+        with patch.object(
+            schedule,
+            "get_open_cancellations_with_archive",
+            new=AsyncMock(return_value=[cancellation]),
+        ):
+            await cog.cog_load()
+
+        self.assertEqual(bot.add_view.call_count, 2)
+        restored_call = bot.add_view.call_args_list[1]
+        self.assertIsInstance(
+            restored_call.args[0],
+            schedule.CancelledPostView,
+        )
+        self.assertEqual(restored_call.kwargs["message_id"], 700)
 
     async def test_panel_rejects_interactions_outside_scheduled_channel(self):
         interaction = SimpleNamespace(
@@ -370,12 +398,18 @@ class SchedulePanelTests(unittest.IsolatedAsyncioTestCase):
                 "sleep",
                 new=AsyncMock(),
             ) as sleep,
+            patch.object(
+                schedule,
+                "archive_pending_cancellations",
+                new=AsyncMock(return_value=True),
+            ) as archive_pending,
         ):
             await cog.on_ready()
 
         self.assertTrue(cog._startup_done)
         self.assertEqual(refresh.await_count, 2)
         sleep.assert_awaited_once_with(schedule.STARTUP_REFRESH_RETRY_SECONDS)
+        archive_pending.assert_awaited_once_with(bot)
 
     async def test_startup_failure_stays_retryable_without_tight_loop(self):
         bot = Mock()
@@ -415,22 +449,205 @@ class SchedulePanelTests(unittest.IsolatedAsyncioTestCase):
                 "get_post_by_message_id",
                 new=AsyncMock(return_value=None),
             ) as get_post,
-            patch.object(
-                schedule,
-                "delete_post_by_message_id",
-                new=AsyncMock(),
-            ) as delete_post,
-            patch.object(
-                schedule,
-                "repost_all_scheduled",
-                new=AsyncMock(),
-            ) as repost,
         ):
             await cog.on_raw_message_delete(payload)
 
         get_post.assert_awaited_once_with("999")
-        delete_post.assert_not_awaited()
-        repost.assert_not_awaited()
+
+    async def test_refresh_deletion_event_is_never_treated_as_cancellation(self):
+        bot = Mock()
+        cog = schedule.ScheduleCog(bot)
+        payload = SimpleNamespace(
+            channel_id=schedule.SCHEDULED_CHANNEL_ID,
+            message_id=123,
+        )
+        schedule._get_internal_deleted_message_ids(bot).add("123")
+
+        with patch.object(
+            schedule,
+            "get_post_by_message_id",
+            new=AsyncMock(),
+        ) as get_post:
+            await cog.on_raw_message_delete(payload)
+
+        get_post.assert_not_awaited()
+        self.assertNotIn(
+            "123",
+            schedule._get_internal_deleted_message_ids(bot),
+        )
+
+    async def test_external_deletion_never_cancels_the_database_post(self):
+        bot = Mock()
+        cog = schedule.ScheduleCog(bot)
+        payload = SimpleNamespace(
+            channel_id=schedule.SCHEDULED_CHANNEL_ID,
+            message_id=321,
+        )
+        post = {
+            "id": 8,
+            "status": "scheduled",
+        }
+
+        with (
+            patch.object(
+                schedule,
+                "get_post_by_message_id",
+                new=AsyncMock(return_value=post),
+            ) as get_post,
+            patch.object(
+                schedule,
+                "cancel_scheduled_post_by_message_id",
+                new=AsyncMock(),
+            ) as cancel_post,
+            self.assertLogs("rota-bot.schedule", level="WARNING"),
+        ):
+            await cog.on_raw_message_delete(payload)
+
+        get_post.assert_awaited_once_with("321")
+        cancel_post.assert_not_awaited()
+
+    async def test_explicit_cancel_button_soft_cancels_and_archives(self):
+        bot = Mock()
+        schedule_message = SimpleNamespace(id=321, delete=AsyncMock())
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=99),
+            response=SimpleNamespace(defer=AsyncMock()),
+            edit_original_response=AsyncMock(),
+        )
+        post = {
+            "id": 8,
+            "status": "scheduled",
+            "discord_message_id": "321",
+        }
+        cancellation = {
+            "id": 8,
+            "cancellation_id": 12,
+        }
+        view = schedule.CancelPostConfirmationView(
+            bot,
+            post_id=8,
+            user_id=99,
+            schedule_message=schedule_message,
+        )
+
+        with (
+            patch.object(
+                schedule,
+                "get_post_by_id",
+                new=AsyncMock(return_value=post),
+            ),
+            patch.object(
+                schedule,
+                "cancel_scheduled_post_by_message_id",
+                new=AsyncMock(return_value=cancellation),
+            ) as cancel_post,
+            patch.object(
+                schedule,
+                "archive_cancellation",
+                new=AsyncMock(return_value=True),
+            ) as archive,
+        ):
+            await view._on_confirm(interaction)
+
+        cancel_post.assert_awaited_once()
+        self.assertEqual(cancel_post.await_args.args[0], "321")
+        archive.assert_awaited_once_with(bot, cancellation)
+        schedule_message.delete.assert_awaited_once()
+        self.assertIn(
+            "moved to the archive",
+            interaction.edit_original_response.await_args.kwargs["content"],
+        )
+
+    async def test_cancellation_archive_has_persistent_reschedule_button(self):
+        archive_message = SimpleNamespace(id=700)
+        archive_channel = SimpleNamespace(
+            send=AsyncMock(return_value=archive_message)
+        )
+        bot = Mock()
+        bot.get_channel.return_value = archive_channel
+        cancellation = {
+            "id": 8,
+            "cancellation_id": 12,
+            "cancelled_at": 1_000,
+            "cancelled_scheduled_at": 2_000,
+            "created_by": "42",
+            "content": "Cancelled content",
+            "image_path": None,
+            "status": "cancelled",
+            "cancellation_archive_message_id": None,
+            "rescheduled_at": None,
+            "rescheduled_by": None,
+        }
+
+        with patch.object(
+            schedule,
+            "record_cancellation_archive_message",
+            new=AsyncMock(return_value=True),
+        ) as record:
+            self.assertTrue(
+                await schedule.archive_cancellation(bot, cancellation)
+            )
+
+        sent = archive_channel.send.await_args
+        self.assertIn("Scheduled post cancelled", sent.args[0])
+        view = sent.kwargs["view"]
+        self.assertIsInstance(view, schedule.CancelledPostView)
+        self.assertTrue(view.is_persistent())
+        self.assertEqual(view.children[0].label, "Reschedule")
+        record.assert_awaited_once_with(12, "700")
+
+    async def test_rescheduling_updates_archive_and_refreshes_schedule(self):
+        bot = Mock()
+        archive_message = SimpleNamespace(edit=AsyncMock())
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=99),
+            response=SimpleNamespace(edit_message=AsyncMock()),
+        )
+        cancellation = {
+            "id": 8,
+            "cancellation_id": 12,
+            "cancelled_at": 1_000,
+            "cancelled_scheduled_at": 2_000,
+            "created_by": "42",
+            "scheduled_at": 3_000,
+            "rescheduled_at": 1_100,
+            "rescheduled_by": "99",
+        }
+        view = schedule.RescheduleCancelledView(
+            bot,
+            cancellation_id=12,
+            user_id=99,
+            archive_message=archive_message,
+        )
+
+        with (
+            patch.object(schedule.time, "time", return_value=1_100),
+            patch.object(
+                schedule,
+                "reschedule_cancelled_post",
+                new=AsyncMock(return_value=True),
+            ) as reschedule,
+            patch.object(
+                schedule,
+                "get_cancellation_with_post",
+                new=AsyncMock(return_value=cancellation),
+            ),
+            patch.object(
+                schedule,
+                "repost_all_scheduled",
+                new=AsyncMock(return_value=True),
+            ) as repost,
+        ):
+            await view._finalize_time(
+                interaction,
+                3_000,
+                schedule.datetime.now(tz=schedule.UTC),
+            )
+
+        reschedule.assert_awaited_once_with(12, 3_000, "99", 1_100)
+        archive_message.edit.assert_awaited_once()
+        self.assertIsNone(archive_message.edit.await_args.kwargs["view"])
+        repost.assert_awaited_once_with(bot)
 
 
 class ScheduleComposerTests(unittest.TestCase):

@@ -50,10 +50,23 @@ class OptionalClaimingMigrationTests(unittest.IsolatedAsyncioTestCase):
 
                 async with aiosqlite.connect(database.DB_PATH) as db:
                     cursor = await db.execute(
-                        "SELECT status, skip_unclaimed_pings FROM posts ORDER BY id"
+                        """
+                        SELECT
+                            status,
+                            skip_unclaimed_pings,
+                            post_to_discord,
+                            discord_delay_minutes,
+                            x_published_at
+                        FROM posts
+                        ORDER BY id
+                        """
                     )
                     self.assertEqual(
-                        await cursor.fetchall(), [("scheduled", 1), ("live", 0)]
+                        await cursor.fetchall(),
+                        [
+                            ("scheduled", 1, 1, 0, None),
+                            ("live", 0, 1, 0, None),
+                        ],
                     )
                     await db.execute(
                         "UPDATE posts SET skip_unclaimed_pings = 0 WHERE status = 'scheduled'"
@@ -119,6 +132,122 @@ class OptionalClaimingMigrationTests(unittest.IsolatedAsyncioTestCase):
                         "SELECT COUNT(*) FROM post_alert_deliveries"
                     )
                     self.assertEqual((await cursor.fetchone())[0], 0)
+            finally:
+                database.DB_PATH = original_db_path
+                database.IMAGES_DIR = original_images_dir
+
+
+class DiscordDeliveryPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_success_queues_due_channels_and_survives_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_db_path = database.DB_PATH
+            original_images_dir = database.IMAGES_DIR
+            database.DB_PATH = Path(temp_dir) / "rota.db"
+            database.IMAGES_DIR = Path(temp_dir) / "images"
+            try:
+                await database.init_db()
+                post_id = await database.insert_post(
+                    discord_message_id="77",
+                    content="Delayed link",
+                    scheduled_at=1,
+                    created_by="1",
+                    discord_delay_minutes=15,
+                )
+                self.assertTrue(
+                    await database.transition_due_post_to_live(
+                        post_id,
+                        "77",
+                        f"live_{post_id}",
+                        2,
+                    )
+                )
+                await database.record_x_post_success(
+                    post_id,
+                    "https://x.com/i/web/status/123",
+                    1_000,
+                    [100, 200, 100],
+                    15,
+                )
+
+                self.assertEqual(
+                    await database.get_due_discord_deliveries(1_899),
+                    [],
+                )
+                due = await database.get_due_discord_deliveries(1_900)
+                self.assertEqual(
+                    [delivery["channel_id"] for delivery in due],
+                    ["100", "200"],
+                )
+
+                self.assertTrue(
+                    await database.record_discord_delivery_success(
+                        post_id,
+                        "100",
+                        1_900,
+                        "500",
+                    )
+                )
+                await database.record_discord_delivery_failure(
+                    post_id,
+                    "200",
+                    1_900,
+                )
+
+                await database.init_db()
+                remaining = await database.get_due_discord_deliveries(1_901)
+                self.assertEqual(len(remaining), 1)
+                self.assertEqual(remaining[0]["channel_id"], "200")
+                self.assertEqual(remaining[0]["attempt_count"], 1)
+                post = await database.get_post_by_id(post_id)
+                self.assertEqual(post["x_published_at"], 1_000)
+                self.assertEqual(
+                    post["tweet_url"],
+                    "https://x.com/i/web/status/123",
+                )
+            finally:
+                database.DB_PATH = original_db_path
+                database.IMAGES_DIR = original_images_dir
+
+    async def test_discord_settings_only_change_scheduled_posts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_db_path = database.DB_PATH
+            original_images_dir = database.IMAGES_DIR
+            database.DB_PATH = Path(temp_dir) / "rota.db"
+            database.IMAGES_DIR = Path(temp_dir) / "images"
+            try:
+                await database.init_db()
+                post_id = await database.insert_post(
+                    discord_message_id="88",
+                    content="Settings",
+                    scheduled_at=1,
+                    created_by="1",
+                )
+                self.assertTrue(
+                    await database.update_scheduled_post_discord_settings(
+                        post_id,
+                        False,
+                        60,
+                    )
+                )
+                post = await database.get_post_by_id(post_id)
+                self.assertEqual(post["post_to_discord"], 0)
+                self.assertEqual(post["discord_delay_minutes"], 60)
+
+                self.assertTrue(
+                    await database.transition_due_post_to_live(
+                        post_id,
+                        "88",
+                        f"live_{post_id}",
+                        2,
+                    )
+                )
+                self.assertFalse(
+                    await database.update_scheduled_post_discord_settings(
+                        post_id,
+                        True,
+                        0,
+                    )
+                )
             finally:
                 database.DB_PATH = original_db_path
                 database.IMAGES_DIR = original_images_dir

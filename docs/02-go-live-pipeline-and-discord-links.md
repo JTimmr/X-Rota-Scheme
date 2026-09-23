@@ -17,7 +17,7 @@ If the goal is For You, the highest-leverage pipeline change is:
 3. **Stop, delay, or narrow the automatic chat-link dump**, and stop asking people to like/comment from that link.
 4. If the inner group should respond at all, they should meet the post in Home or Following and leave a real reply, not a duty like from a Discord URL.
 
-That is a **strong inference from current source comments**, not a live A/B result on this account. The clean next step is already sketched in `TODO.md`: schedule as usual, but optionally skip Discord, skip X, or delay the Discord send.
+That is a **strong inference from current source comments**, not a live A/B result on this account. The scheduler now supports the clean test: publish to X while either skipping the live-link channels or delaying their URL delivery.
 
 ## What the bot does today at go-live
 
@@ -26,10 +26,11 @@ For an automatic-X slot the 60-second scheduler:
 1. Marks the SQLite row `scheduled` → `live`.
 2. Deletes the schedule-channel message.
 3. Uploads media if needed and calls X once.
-4. Stores `tweet_url` on success.
-5. Sends **only the URL** to `X_LIVE_POST_LINK_CHANNEL_ID_1` and `_2`.
+4. Stores `tweet_url` and the confirmed X publication time on success.
+5. Queues one persisted URL delivery per configured live-link channel, unless Discord live links are disabled for the post.
 6. Posts a richer record to the archive channel.
 7. Pings claimers in reminders: "Your post just went live! Time to share the link and engage with replies." plus the URL.
+8. Sends queued live-link URLs when their per-post delay expires; immediate deliveries run later in the same scheduler tick.
 
 Manual-X slots skip the X call and skip the live-link channels. They still archive and remind.
 
@@ -72,7 +73,7 @@ Treat the live-link channels as a **distribution switch**, not as ranking fuel.
 | --- | --- | --- | --- |
 | Current: immediate URL dump + "go like/comment" | No ranking credit for those clicks; possible Home-serve waste | High awareness, chore engagement | Do not treat as the growth path |
 | Remind claimers, but do not send public chat links | Removes the groupchat coordination path | Team still knows the slot fired | Best first algorithm-facing change |
-| Delay the Discord URL (existing TODO) | Gives Home a head start before direct-nav | Still informs the server later | Best experiment if Discord awareness still matters |
+| Delay the Discord URL | Gives Home a head start before direct-nav | Still informs the server later | Best experiment if Discord awareness still matters |
 | No X post, Discord only | No For You candidate | Internal preview | Use only for dry runs |
 | Archive-only, no link channels, no "go engage" | Cleanest For You isolation | Ops record only | Control arm |
 
@@ -88,7 +89,7 @@ That last point is community operations, not a current "author replies back" coe
 
 Do not wait for the historical caption backfill. The pipeline can be tested on ordinary upcoming slots, with content held as similar as it already is.
 
-Use the three switches already listed in `TODO.md`:
+Use the three live-link settings available while scheduling and on each scheduled-post card:
 
 1. **No Discord live links** — X post, archive, reminders; link channels silent.
 2. **Delayed Discord links** — same X post; URL hits chats after a chosen lag (30–60 minutes is a reasonable first band; 3 hours is a second band).

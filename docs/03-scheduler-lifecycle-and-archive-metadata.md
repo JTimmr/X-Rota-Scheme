@@ -19,12 +19,16 @@ Created when scheduled:
 | `tweet_url` | Null until a successful automatic X post |
 | `skip_unclaimed_pings` | Default `1` (claimer optional) |
 | `post_to_x` | `1` automatic X, `0` manual X |
+| `post_to_discord` | `1` queue successful X links for live-link channels, `0` skip them |
+| `discord_delay_minutes` | Delay after confirmed X publication; default `0` |
+| `x_published_at` | Null until X returns a confirmed successful post ID |
 
 Related tables that can exist before go-live:
 
 - `claims` — who claimed the slot (`post_id`, `user_id`, `created_at`)
 - `unavailable` — who opted out of fallback pings
 - `post_alert_deliveries` — whether the 4h unclaimed and/or 15m pre-live alerts already sent
+- `post_discord_deliveries` — one persisted live-link delivery per configured channel, including due time, attempts, Discord message ID, and delivery time
 
 ## What changes at go-live
 
@@ -35,15 +39,13 @@ Related tables that can exist before go-live:
 
 That second write **replaces** the original schedule-channel message ID with a synthetic placeholder. The live archive Discord message ID is **not** stored.
 
-If automatic X succeeds, a second update sets `tweet_url` to `https://x.com/i/web/status/{id}`. Failure and unknown outcomes leave `tweet_url` null. Manual-X slots never set it.
+If automatic X succeeds, a second transaction sets `tweet_url` to `https://x.com/i/web/status/{id}`, records `x_published_at`, and queues enabled Discord live-link deliveries. Each delivery is due at `x_published_at + discord_delay_minutes`. Failure and unknown outcomes leave `tweet_url` and `x_published_at` null. Manual-X slots never set them.
 
 Nothing else on the row is updated. In particular the bot does **not** store:
 
-- actual go-live timestamp
 - X numeric post ID as its own column (only the URL, and only on success)
 - X outcome (`success` / `failed` / `unknown`)
 - whether media uploaded
-- which Discord link channels received the URL
 - archive-channel message ID
 - impressions, likes, replies, or any later metrics
 - topic, objective, experiment arm, or price/Discord context
@@ -66,7 +68,7 @@ The archive message does **not** list claimers, unavailable users, `skip_unclaim
 
 ## Side effects that are not metadata
 
-Successful automatic posts also send the bare URL to the configured live-link channels. Those channel messages are not referenced from SQLite.
+Successful automatic posts queue the bare URL for each configured live-link channel unless `post_to_discord` is off. Delivery rows retain the target channel, due time, attempt count, successful send time, and returned Discord message ID. Failed sends remain pending for the next scheduler tick.
 
 Reminders ping claimers (or, for required-claimer slots with nobody claimed, the team) with outcome text and the same content embed. Delivery of *go-live* reminders is not written to `post_alert_deliveries`; that table only dedupes the 4h and 15m pre-live alerts.
 
@@ -74,14 +76,14 @@ Reminders ping claimers (or, for required-claimer slots with nobody claimed, the
 
 SQLite after go-live can reconstruct:
 
-- text, scheduled time, who scheduled it, optional/required claiming flag, automatic vs manual X, media path if not deleted, and tweet URL if auto-X succeeded
+- text, scheduled time, who scheduled it, optional/required claiming flag, automatic vs manual X, live-link setting and delay, media path if not deleted, tweet URL and publication time if auto-X succeeded
 - who had claimed or marked unavailable, and whether pre-live alerts fired
+- which configured live-link channels were queued and successfully delivered
 
 It cannot reconstruct from the database alone:
 
-- when it actually went live
 - whether X failed or the outcome was unknown
-- the archive or live-link Discord messages
+- the archive Discord message
 - any performance metrics
 - market or Discord-activity context
 

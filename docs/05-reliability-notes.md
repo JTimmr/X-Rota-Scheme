@@ -2,7 +2,7 @@
 
 These are publish-lifecycle issues. They are independent of For You strategy and independent of the later content backfill. Fixing them makes experiments trustworthy: you cannot learn from a slot if you are unsure whether X accepted it or whether Discord side effects ran.
 
-Verification while this was written: `python -m unittest discover -s tests -v` (114 tests) and `python -m compileall -q src tests` both passed.
+Verification while this was written: `python -m unittest discover -s tests -v` (133 tests) and `python -m compileall -q src tests` both passed.
 
 ## What already works
 
@@ -12,6 +12,8 @@ Verification while this was written: `python -m unittest discover -s tests -v` (
 - Atomic `scheduled` → `live` claim so two workers cannot both tweet the same row.
 - Persistent dedupe for the 4h and 15m pre-live alerts.
 - Manual-X path that skips the X API and live-link channels.
+- Per-post live-link disable/delay controls with persisted, per-channel delivery retries.
+- Confirmed X publication time stored for successful automatic posts.
 
 ## Problems that affect pipeline experiments
 
@@ -23,17 +25,15 @@ Verification while this was written: `python -m unittest discover -s tests -v` (
 
 **Overdue catch-up can burst.** After downtime, every due `scheduled` row can fire in one tick, with no `ORDER BY scheduled_at ASC` and no stale-slot confirmation.
 
-**Go-live Discord side effects are not an outbox.** Link-channel sends are caught per channel; archive or reminder failure after `live` is not retried from the database.
-
-**No actual `published_at`.** Archive text has a Discord timestamp; SQLite does not. Pipeline tests that need "minutes from schedule to X" cannot be read from the DB.
+**Archive and go-live reminder side effects are not an outbox.** Live-link sends are now persisted and retried per channel, but an archive or go-live reminder failure after `live` is still not retried from the database.
 
 ## Small fixes worth doing before strategy tests
 
 1. Keep `scheduled` until a lease/dispatch state, then persist a real X outcome: `published`, `failed_known`, `outcome_unknown`, or `not_applicable` for manual X.
-2. Store `x_post_id`, `tweet_url`, and `published_at` separately.
-3. Queue archive, live-link, and reminder sends so a Discord blip cannot erase a successful tweet ID.
+2. Store `x_post_id` separately; `tweet_url` and `x_published_at` are now persisted on confirmed success.
+3. Queue archive and reminder sends too; live-link sends already use persisted per-channel delivery rows.
 4. Move media processing off the reminder tick.
 5. `ORDER BY scheduled_at ASC` and do not auto-dump a huge overdue backlog.
-6. Persist whether live-link channels were sent, skipped, or delayed — required for the Discord-link experiment in [02](02-go-live-pipeline-and-discord-links.md).
+6. Add bounded retry/backoff policy for persistently missing or forbidden live-link channels.
 
 Do not wait for content metadata (topic, campaign, semantic hash) to do these. That layer belongs with the later backfill.

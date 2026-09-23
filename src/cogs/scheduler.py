@@ -25,13 +25,16 @@ from database import (
     get_active_user_ids,
     get_available_active_user_ids,
     get_claimers_for_post,
+    get_due_discord_deliveries,
     get_due_posts,
     get_post_by_id,
     get_posts_without_claims_in_range,
     get_scheduled_posts_in_range,
+    record_discord_delivery_failure,
+    record_discord_delivery_success,
     record_post_alert_delivery,
+    record_x_post_success,
     transition_due_post_to_live,
-    update_post_tweet_url,
     was_post_alert_delivered,
 )
 from x_client import (
@@ -114,6 +117,11 @@ def _post_to_x(post: dict) -> bool:
     return bool(post.get("post_to_x", 1))
 
 
+def _post_to_discord(post: dict) -> bool:
+    """Whether successful X links should reach configured live-link channels."""
+    return bool(post.get("post_to_discord", 1))
+
+
 class SchedulerCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -131,6 +139,7 @@ class SchedulerCog(commands.Cog):
         try:
             await self._check_go_live()
             reminder_now = int(time.time())
+            await self._check_discord_deliveries(reminder_now)
             await self._check_pre_post_reminders(reminder_now)
             await self._check_unassigned_posts(reminder_now)
             await self._check_daily_gap()
@@ -320,7 +329,19 @@ class SchedulerCog(commands.Cog):
                     )
 
                 if x_result.status == X_POST_SUCCESS and x_result.url:
-                    await update_post_tweet_url(post["id"], x_result.url)
+                    published_at = int(time.time())
+                    discord_channel_ids = (
+                        X_LIVE_POST_LINK_CHANNEL_IDS
+                        if _post_to_discord(post)
+                        else []
+                    )
+                    await record_x_post_success(
+                        post["id"],
+                        x_result.url,
+                        published_at,
+                        discord_channel_ids,
+                        int(post.get("discord_delay_minutes", 0)),
+                    )
                 elif x_result.status == X_POST_UNKNOWN:
                     log.error(
                         "X outcome is unknown for post %s; check X before retrying",
@@ -332,33 +353,6 @@ class SchedulerCog(commands.Cog):
                         post["id"],
                         x_result.detail or "unspecified confirmed failure",
                     )
-
-            if (
-                x_result
-                and x_result.status == X_POST_SUCCESS
-                and x_result.url
-                and X_LIVE_POST_LINK_CHANNEL_IDS
-            ):
-                for link_channel_id in X_LIVE_POST_LINK_CHANNEL_IDS:
-                    link_channel = self.bot.get_channel(link_channel_id)
-                    if not link_channel:
-                        log.warning("X live link channel %s not found", link_channel_id)
-                        continue
-                    try:
-                        await link_channel.send(
-                            x_result.url,
-                            allowed_mentions=discord.AllowedMentions.none(),
-                        )
-                    except discord.Forbidden:
-                        log.warning(
-                            "No permission to send X link in channel %s",
-                            link_channel_id,
-                        )
-                    except discord.HTTPException:
-                        log.exception(
-                            "Failed to send X link to channel %s",
-                            link_channel_id,
-                        )
 
             if archive_channel:
                 live_ts = int(time.time())
@@ -439,6 +433,77 @@ class SchedulerCog(commands.Cog):
                 )
 
             log.info("Post %s completed go-live processing", post["id"])
+
+    async def _check_discord_deliveries(self, now: int | None = None):
+        if now is None:
+            now = int(time.time())
+        deliveries = await get_due_discord_deliveries(now)
+        for delivery in deliveries:
+            channel_id = delivery["channel_id"]
+            try:
+                numeric_channel_id = int(channel_id)
+            except (TypeError, ValueError):
+                log.error(
+                    "Invalid Discord live-link channel ID %r for post %s",
+                    channel_id,
+                    delivery["post_id"],
+                )
+                await record_discord_delivery_failure(
+                    delivery["post_id"],
+                    str(channel_id),
+                    now,
+                )
+                continue
+
+            channel = self.bot.get_channel(numeric_channel_id)
+            if not channel:
+                log.warning("X live link channel %s not found", numeric_channel_id)
+                await record_discord_delivery_failure(
+                    delivery["post_id"],
+                    str(channel_id),
+                    now,
+                )
+                continue
+
+            try:
+                message = await channel.send(
+                    delivery["tweet_url"],
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.Forbidden:
+                log.warning(
+                    "No permission to send X link in channel %s",
+                    numeric_channel_id,
+                )
+                await record_discord_delivery_failure(
+                    delivery["post_id"],
+                    str(channel_id),
+                    now,
+                )
+                continue
+            except discord.HTTPException:
+                log.exception(
+                    "Failed to send X link to channel %s",
+                    numeric_channel_id,
+                )
+                await record_discord_delivery_failure(
+                    delivery["post_id"],
+                    str(channel_id),
+                    now,
+                )
+                continue
+
+            await record_discord_delivery_success(
+                delivery["post_id"],
+                str(channel_id),
+                now,
+                str(message.id) if getattr(message, "id", None) is not None else None,
+            )
+            log.info(
+                "Delivered X link for post %s to Discord channel %s",
+                delivery["post_id"],
+                numeric_channel_id,
+            )
 
     async def _check_pre_post_reminders(self, now: int | None = None):
         if now is None:

@@ -144,6 +144,8 @@ class PanelDatabaseIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(row["content"], "Panel integration post")
                 self.assertEqual(row["created_by"], "123")
                 self.assertEqual(row["post_to_x"], 1)
+                self.assertEqual(row["post_to_discord"], 1)
+                self.assertEqual(row["discord_delay_minutes"], 0)
                 self.assertEqual(row["skip_unclaimed_pings"], 1)
                 self.assertEqual(Path(row["image_path"]).suffix, ".png")
                 self.assertTrue(Path(row["image_path"]).is_file())
@@ -304,6 +306,11 @@ class ClaimNotificationIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         SimpleNamespace(time=advancing_clock),
                     ),
                     patch.object(cog, "_check_go_live", new=AsyncMock()),
+                    patch.object(
+                        cog,
+                        "_check_discord_deliveries",
+                        new=AsyncMock(),
+                    ),
                     patch.object(cog, "_check_daily_gap", new=AsyncMock()),
                 ):
                     await scheduler.SchedulerCog.tick.coro(cog)
@@ -675,7 +682,7 @@ class GoLiveDispatchIntegrationTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 scheduler,
-                "update_post_tweet_url",
+                "record_x_post_success",
                 new=AsyncMock(),
             ),
             patch.object(
@@ -697,6 +704,159 @@ class GoLiveDispatchIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 call("Video", "video.mp4"),
             ],
         )
+
+    async def test_discord_off_records_x_success_without_link_deliveries(self):
+        post = {
+            "id": 1,
+            "discord_message_id": "1",
+            "content": "X only",
+            "scheduled_at": 1,
+            "created_by": "10",
+            "image_path": None,
+            "post_to_x": 1,
+            "post_to_discord": 0,
+            "discord_delay_minutes": 60,
+            "skip_unclaimed_pings": 1,
+        }
+        bot = Mock()
+        bot.get_channel.return_value = None
+        record_success = AsyncMock()
+        with (
+            patch.object(
+                scheduler,
+                "get_due_posts",
+                new=AsyncMock(return_value=[post]),
+            ),
+            patch.object(
+                scheduler,
+                "get_claimers_for_post",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                scheduler.SchedulerCog,
+                "_take_due_post",
+                new=AsyncMock(return_value=post),
+            ),
+            patch.object(
+                scheduler,
+                "post_tweet_result",
+                return_value=scheduler.XPostResult(
+                    scheduler.X_POST_SUCCESS,
+                    "https://x.com/i/web/status/1",
+                ),
+            ),
+            patch.object(
+                scheduler,
+                "record_x_post_success",
+                new=record_success,
+            ),
+            patch.object(scheduler, "X_ENABLED", True),
+            patch.object(
+                scheduler,
+                "X_LIVE_POST_LINK_CHANNEL_IDS",
+                [100, 200],
+            ),
+            patch.object(
+                scheduler,
+                "time",
+                SimpleNamespace(time=Mock(return_value=1_000)),
+            ),
+        ):
+            await scheduler.SchedulerCog(bot)._check_go_live()
+
+        record_success.assert_awaited_once_with(
+            1,
+            "https://x.com/i/web/status/1",
+            1_000,
+            [],
+            60,
+        )
+
+
+class DiscordLinkDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_due_delivery_sends_once_and_records_message(self):
+        channel = SimpleNamespace(
+            send=AsyncMock(return_value=SimpleNamespace(id=900)),
+        )
+        bot = Mock()
+        bot.get_channel.return_value = channel
+        delivery = {
+            "post_id": 1,
+            "channel_id": "100",
+            "due_at": 1_000,
+            "attempt_count": 0,
+            "tweet_url": "https://x.com/i/web/status/1",
+        }
+        with (
+            patch.object(
+                scheduler,
+                "get_due_discord_deliveries",
+                new=AsyncMock(return_value=[delivery]),
+            ),
+            patch.object(
+                scheduler,
+                "record_discord_delivery_success",
+                new=AsyncMock(return_value=True),
+            ) as record_success,
+            patch.object(
+                scheduler,
+                "record_discord_delivery_failure",
+                new=AsyncMock(),
+            ) as record_failure,
+        ):
+            await scheduler.SchedulerCog(bot)._check_discord_deliveries(1_000)
+
+        bot.get_channel.assert_called_once_with(100)
+        channel.send.assert_awaited_once()
+        sent = channel.send.await_args
+        self.assertEqual(
+            sent.args[0],
+            "https://x.com/i/web/status/1",
+        )
+        self.assertEqual(
+            sent.kwargs["allowed_mentions"].to_dict(),
+            schedule.discord.AllowedMentions.none().to_dict(),
+        )
+        record_success.assert_awaited_once_with(
+            1,
+            "100",
+            1_000,
+            "900",
+        )
+        record_failure.assert_not_awaited()
+
+    async def test_missing_channel_stays_pending_for_retry(self):
+        bot = Mock()
+        bot.get_channel.return_value = None
+        delivery = {
+            "post_id": 1,
+            "channel_id": "100",
+            "due_at": 1_000,
+            "attempt_count": 0,
+            "tweet_url": "https://x.com/i/web/status/1",
+        }
+        with (
+            patch.object(
+                scheduler,
+                "get_due_discord_deliveries",
+                new=AsyncMock(return_value=[delivery]),
+            ),
+            patch.object(
+                scheduler,
+                "record_discord_delivery_success",
+                new=AsyncMock(),
+            ) as record_success,
+            patch.object(
+                scheduler,
+                "record_discord_delivery_failure",
+                new=AsyncMock(),
+            ) as record_failure,
+            self.assertLogs("rota-bot.scheduler", level="WARNING"),
+        ):
+            await scheduler.SchedulerCog(bot)._check_discord_deliveries(1_000)
+
+        record_success.assert_not_awaited()
+        record_failure.assert_awaited_once_with(1, "100", 1_000)
 
 
 class GoLiveOutcomeNotificationTests(unittest.IsolatedAsyncioTestCase):

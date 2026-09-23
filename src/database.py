@@ -25,7 +25,10 @@ async def init_db():
                 image_path TEXT,
                 tweet_url TEXT,
                 skip_unclaimed_pings INTEGER NOT NULL DEFAULT 1,
-                post_to_x INTEGER NOT NULL DEFAULT 1
+                post_to_x INTEGER NOT NULL DEFAULT 1,
+                post_to_discord INTEGER NOT NULL DEFAULT 1,
+                discord_delay_minutes INTEGER NOT NULL DEFAULT 0,
+                x_published_at INTEGER
             )
         """)
         await db.execute("""
@@ -57,6 +60,23 @@ async def init_db():
                 FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS post_discord_deliveries (
+                post_id INTEGER NOT NULL,
+                channel_id TEXT NOT NULL,
+                due_at INTEGER NOT NULL,
+                delivered_at INTEGER,
+                discord_message_id TEXT,
+                last_attempt_at INTEGER,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (post_id, channel_id),
+                FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_post_discord_deliveries_due
+            ON post_discord_deliveries (delivered_at, due_at)
+        """)
         await db.commit()
 
         # Migrate from old schema: rename reactions to claims if needed
@@ -84,6 +104,19 @@ async def init_db():
             await db.execute(
                 "ALTER TABLE posts ADD COLUMN post_to_x INTEGER NOT NULL DEFAULT 1"
             )
+            await db.commit()
+        if "post_to_discord" not in columns:
+            await db.execute(
+                "ALTER TABLE posts ADD COLUMN post_to_discord INTEGER NOT NULL DEFAULT 1"
+            )
+            await db.commit()
+        if "discord_delay_minutes" not in columns:
+            await db.execute(
+                "ALTER TABLE posts ADD COLUMN discord_delay_minutes INTEGER NOT NULL DEFAULT 0"
+            )
+            await db.commit()
+        if "x_published_at" not in columns:
+            await db.execute("ALTER TABLE posts ADD COLUMN x_published_at INTEGER")
             await db.commit()
 
         # Phase 1: make all posts scheduled at upgrade time optional exactly once.
@@ -118,14 +151,19 @@ async def insert_post(
     created_by: str,
     image_path: str | None = None,
     post_to_x: bool = True,
+    post_to_discord: bool = True,
+    discord_delay_minutes: int = 0,
 ) -> int:
+    if discord_delay_minutes < 0:
+        raise ValueError("discord_delay_minutes cannot be negative")
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """
             INSERT INTO posts (
                 discord_message_id, content, scheduled_at, created_by, created_at,
-                image_path, post_to_x, skip_unclaimed_pings
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                image_path, post_to_x, post_to_discord, discord_delay_minutes,
+                skip_unclaimed_pings
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 discord_message_id,
@@ -135,6 +173,8 @@ async def insert_post(
                 int(time.time()),
                 image_path,
                 1 if post_to_x else 0,
+                1 if post_to_discord else 0,
+                discord_delay_minutes,
                 1,
             ),
         )
@@ -252,6 +292,112 @@ async def update_post_tweet_url(post_id: int, tweet_url: str):
         await db.commit()
 
 
+async def record_x_post_success(
+    post_id: int,
+    tweet_url: str,
+    published_at: int,
+    discord_channel_ids: list[int],
+    discord_delay_minutes: int,
+):
+    """Persist X success and enqueue each configured Discord link delivery."""
+    due_at = published_at + discord_delay_minutes * 60
+    channel_ids = list(dict.fromkeys(str(channel_id) for channel_id in discord_channel_ids))
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA foreign_keys = ON")
+        await db.execute(
+            """
+            UPDATE posts
+            SET tweet_url = ?, x_published_at = ?
+            WHERE id = ?
+            """,
+            (tweet_url, published_at, post_id),
+        )
+        if channel_ids:
+            await db.executemany(
+                """
+                INSERT OR IGNORE INTO post_discord_deliveries (
+                    post_id, channel_id, due_at
+                ) VALUES (?, ?, ?)
+                """,
+                [(post_id, channel_id, due_at) for channel_id in channel_ids],
+            )
+        await db.commit()
+
+
+async def get_due_discord_deliveries(now: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                d.post_id,
+                d.channel_id,
+                d.due_at,
+                d.attempt_count,
+                p.tweet_url
+            FROM post_discord_deliveries d
+            JOIN posts p ON p.id = d.post_id
+            WHERE d.delivered_at IS NULL
+              AND d.due_at <= ?
+              AND p.status = 'live'
+              AND p.tweet_url IS NOT NULL
+            ORDER BY d.due_at, d.post_id, d.channel_id
+            """,
+            (now,),
+        )
+        return [dict(row) async for row in cursor]
+
+
+async def record_discord_delivery_success(
+    post_id: int,
+    channel_id: str,
+    delivered_at: int,
+    discord_message_id: str | None,
+) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            UPDATE post_discord_deliveries
+            SET delivered_at = ?,
+                discord_message_id = ?,
+                last_attempt_at = ?,
+                attempt_count = attempt_count + 1
+            WHERE post_id = ?
+              AND channel_id = ?
+              AND delivered_at IS NULL
+            """,
+            (
+                delivered_at,
+                discord_message_id,
+                delivered_at,
+                post_id,
+                str(channel_id),
+            ),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def record_discord_delivery_failure(
+    post_id: int,
+    channel_id: str,
+    attempted_at: int,
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE post_discord_deliveries
+            SET last_attempt_at = ?,
+                attempt_count = attempt_count + 1
+            WHERE post_id = ?
+              AND channel_id = ?
+              AND delivered_at IS NULL
+            """,
+            (attempted_at, post_id, str(channel_id)),
+        )
+        await db.commit()
+
+
 async def update_post_skip_unclaimed_pings(post_id: int, skip: bool):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -259,6 +405,30 @@ async def update_post_skip_unclaimed_pings(post_id: int, skip: bool):
             (1 if skip else 0, post_id),
         )
         await db.commit()
+
+
+async def update_scheduled_post_discord_settings(
+    post_id: int,
+    post_to_discord: bool,
+    discord_delay_minutes: int,
+) -> bool:
+    if discord_delay_minutes < 0:
+        raise ValueError("discord_delay_minutes cannot be negative")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            UPDATE posts
+            SET post_to_discord = ?, discord_delay_minutes = ?
+            WHERE id = ? AND status = 'scheduled'
+            """,
+            (
+                1 if post_to_discord else 0,
+                discord_delay_minutes,
+                post_id,
+            ),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
 
 
 async def update_post_message_id(post_id: int, new_message_id: str):

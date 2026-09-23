@@ -437,10 +437,11 @@ class ScheduleComposerTests(unittest.TestCase):
     def test_modal_contains_required_text_and_optional_single_upload(self):
         modal = schedule.SchedulePostModal(Mock(), user_id=123)
 
-        self.assertEqual(len(modal.children), 2)
-        content_label, upload_label = modal.children
+        self.assertEqual(len(modal.children), 3)
+        content_label, upload_label, delivery_label = modal.children
         self.assertIsInstance(content_label, discord.ui.Label)
         self.assertIsInstance(upload_label, discord.ui.Label)
+        self.assertIsInstance(delivery_label, discord.ui.Label)
 
         content_input = content_label.component
         self.assertIsInstance(content_input, discord.ui.TextInput)
@@ -452,6 +453,15 @@ class ScheduleComposerTests(unittest.TestCase):
         self.assertFalse(upload.required)
         self.assertEqual(upload.min_values, 0)
         self.assertEqual(upload.max_values, 1)
+
+        delivery = delivery_label.component
+        self.assertIsInstance(delivery, discord.ui.Select)
+        self.assertTrue(delivery.required)
+        self.assertEqual(delivery.options[0].value, "off")
+        self.assertEqual(
+            [int(option.value) for option in delivery.options[1:]],
+            [minutes for _, minutes in schedule.DISCORD_DELAY_CHOICES],
+        )
 
     def test_filename_and_mime_precheck_rejects_spoof_mismatches(self):
         valid = SimpleNamespace(filename="photo.JPEG", content_type="image/jpeg")
@@ -661,6 +671,8 @@ class ScheduleComposerSubmissionTests(unittest.IsolatedAsyncioTestCase):
             123,
             "data/images/post.gif",
             post_to_x=True,
+            post_to_discord=True,
+            discord_delay_minutes=0,
         )
         interaction.followup.send.assert_awaited_once()
         followup_call = interaction.followup.send.await_args
@@ -698,8 +710,43 @@ class ScheduleComposerSubmissionTests(unittest.IsolatedAsyncioTestCase):
             123,
             None,
             post_to_x=True,
+            post_to_discord=True,
+            discord_delay_minutes=0,
         )
         interaction.followup.send.assert_awaited_once()
+
+    async def test_delivery_selection_is_forwarded_to_time_picker(self):
+        bot = Mock()
+        cases = (
+            ("off", False, 0),
+            ("60", True, 60),
+        )
+        for selected, post_to_discord, delay in cases:
+            with self.subTest(selected=selected):
+                modal = schedule.SchedulePostModal(bot, user_id=123)
+                modal.content_input._value = "Delivery post"
+                modal.file_upload._values = []
+                modal.discord_delivery_select._values = [selected]
+                interaction = self._interaction()
+                view = Mock()
+                view._status_text.return_value = "Pick a time"
+
+                with patch.object(
+                    schedule,
+                    "ScheduleView",
+                    return_value=view,
+                ) as schedule_view:
+                    await modal.on_submit(interaction)
+
+                schedule_view.assert_called_once_with(
+                    bot,
+                    "Delivery post",
+                    123,
+                    None,
+                    post_to_x=True,
+                    post_to_discord=post_to_discord,
+                    discord_delay_minutes=delay,
+                )
 
 
 if __name__ == "__main__":

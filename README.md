@@ -59,11 +59,14 @@ Optional environment variables:
 ## Scheduling and claims
 
 The scheduling-channel panel opens one composer for required text and one
-optional JPG/JPEG, PNG, WebP, GIF, or MP4. `/schedule` is the fallback and uses
-the same time picker; set `post_to_x` off for a manual-X slot. The schedule is
-rebuilt after changes, with posts ordered so the soonest is near the bottom and
-the panel sent last. Discord has no native fixed-bottom message, so new chat
-activity can still appear below the panel until the next schedule refresh.
+optional JPG/JPEG, PNG, WebP, GIF, or MP4. The composer also chooses whether a
+successful x.com link reaches the configured live-link channels immediately,
+after a preset delay, or not at all. `/schedule` is the fallback and exposes
+the same behavior through `post_to_discord` and `discord_delay_minutes`; set
+`post_to_x` off for a manual-X slot. The schedule is rebuilt after changes,
+with posts ordered so the soonest is near the bottom and the panel sent last.
+Discord has no native fixed-bottom message, so new chat activity can still
+appear below the panel until the next schedule refresh.
 
 Quick selection offers the next 25 local dates, hours 06:00-22:00, and
 00/15/30/45 minutes. **Enter exact date/time** accepts `YYYY-MM-DD` plus either
@@ -86,7 +89,10 @@ alerts and attempts with no target are not recorded.
 
 Content and media can be changed before go-live. Replacement media is fully
 validated before the database switches away from the old file; failed
-validation leaves the existing attachment intact.
+validation leaves the existing attachment intact. Each scheduled-post card
+also has a **Discord live links** toggle and delay dropdown. These controls
+affect only the configured live-link channels; schedule cards, archive records,
+and reminders remain available.
 
 ## CTO X role rota
 
@@ -130,7 +136,10 @@ retry: failures are logged and identified in archive/reminder messages so the
 team can publish manually. If `create_tweet` raises or returns no usable ID, the
 outcome is treated as unknown and operators must check X before retrying because
 the request may have succeeded. Manual-X slots never call X or broadcast an
-x.com link, but they keep the same archive and reminder cadence.
+x.com link, but they keep the same archive and reminder cadence. Successful
+automatic slots persist one delivery per configured live-link channel. Delays
+start when X confirms publication, survive restarts, and are checked on the
+60-second scheduler tick. Failed Discord sends remain pending for retry.
 
 ## Verification
 

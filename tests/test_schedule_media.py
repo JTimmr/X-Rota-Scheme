@@ -117,6 +117,24 @@ class DiscordMediaEntryTests(unittest.IsolatedAsyncioTestCase):
             rejected.response.send_message.await_args.kwargs["ephemeral"]
         )
 
+    async def test_schedule_command_forwards_discord_delivery_settings(self):
+        cog = schedule.ScheduleCog(Mock())
+        interaction = command_interaction()
+
+        await schedule.ScheduleCog.schedule.callback(
+            cog,
+            interaction,
+            media=None,
+            post_to_x=True,
+            post_to_discord=False,
+            discord_delay_minutes=60,
+        )
+
+        modal = interaction.response.send_modal.await_args.args[0]
+        self.assertIsInstance(modal, schedule.PostContentModal)
+        self.assertFalse(modal.post_to_discord)
+        self.assertEqual(modal.discord_delay_minutes, 60)
+
     async def test_updatemedia_accepts_mp4_and_rejects_non_mp4(self):
         cog = schedule.ScheduleCog(Mock())
         posts = [
@@ -404,6 +422,81 @@ class ScheduledEditMentionSafetyTests(unittest.IsolatedAsyncioTestCase):
                     edit_call.kwargs["allowed_mentions"].to_dict(),
                     discord.AllowedMentions.none().to_dict(),
                 )
+
+    async def test_scheduled_post_can_toggle_and_delay_discord_links(self):
+        bot = Mock()
+        off_view = schedule.PostButtonView(
+            bot,
+            post_id=1,
+            post_to_discord=False,
+            discord_delay_minutes=60,
+        )
+        discord_button = next(
+            item
+            for item in off_view.children
+            if isinstance(item, discord.ui.Button)
+            and item.custom_id == "postdiscord:1"
+        )
+        delay_select = next(
+            item
+            for item in off_view.children
+            if isinstance(item, discord.ui.Select)
+            and item.custom_id == "discorddelay:1"
+        )
+        self.assertIn("off", discord_button.label)
+        self.assertTrue(delay_select.disabled)
+
+        post = {
+            "id": 1,
+            "content": "Delayed",
+            "scheduled_at": 100,
+            "created_by": "789",
+            "status": "scheduled",
+            "skip_unclaimed_pings": 1,
+            "post_to_x": 1,
+            "post_to_discord": 1,
+            "discord_delay_minutes": 0,
+        }
+        delayed = {**post, "discord_delay_minutes": 60}
+        interaction = SimpleNamespace(
+            data={"values": ["60"]},
+            user=SimpleNamespace(id=999),
+            response=SimpleNamespace(
+                edit_message=AsyncMock(),
+                send_message=AsyncMock(),
+            ),
+        )
+        update = AsyncMock(return_value=True)
+        with (
+            patch.object(
+                schedule,
+                "get_post_by_id",
+                new=AsyncMock(side_effect=[post, delayed]),
+            ),
+            patch.object(
+                schedule,
+                "update_scheduled_post_discord_settings",
+                new=update,
+            ),
+            patch.object(
+                schedule,
+                "get_claimers_for_post",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                schedule,
+                "get_unavailable_for_post",
+                new=AsyncMock(return_value=[]),
+            ),
+        ):
+            await schedule.PostButtonView(
+                bot,
+                post_id=1,
+            )._on_discord_delay(interaction)
+
+        update.assert_awaited_once_with(1, True, 60)
+        edited = interaction.response.edit_message.await_args
+        self.assertIn("1 hour", edited.kwargs["content"])
 
 
 if __name__ == "__main__":

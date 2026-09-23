@@ -2,3 +2,4 @@ discord.py==2.7.1
 aiosqlite==0.22.1
 tweepy==4.17.0
 Pillow==12.3.0
+tzdata==2025.2

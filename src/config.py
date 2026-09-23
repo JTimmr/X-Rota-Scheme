@@ -38,6 +38,7 @@ GUILD_ID = int(require_env("DISCORD_GUILD_ID"))
 SCHEDULED_CHANNEL_ID = int(require_env("SCHEDULED_CHANNEL_ID"))
 ARCHIVE_CHANNEL_ID = int(require_env("ARCHIVE_CHANNEL_ID"))
 REMINDERS_CHANNEL_ID = int(require_env("REMINDERS_CHANNEL_ID"))
+ROTA_TIMEZONE = os.environ.get("ROTA_TIMEZONE", "Europe/London")
 
 # Optional role used for team-wide rota alerts; falls back to active users
 ROTA_ALERT_ROLE_ID = _optional_int_env("ROTA_ALERT_ROLE_ID")

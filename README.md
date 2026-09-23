@@ -53,6 +53,8 @@ Optional environment variables:
   absent, X posting is disabled.
 - `X_LIVE_POST_LINK_CHANNEL_ID_1` and
   `X_LIVE_POST_LINK_CHANNEL_ID_2`: channels that receive successful x.com links.
+- `ROTA_TIMEZONE`: timezone displayed on the CTO X live rota image. Defaults
+  to `Europe/London`.
 
 ## Scheduling and claims
 
@@ -85,6 +87,22 @@ alerts and attempts with no target are not recorded.
 Content and media can be changed before go-live. Replacement media is fully
 validated before the database switches away from the old file; failed
 validation leaves the existing attachment intact.
+
+## CTO X role rota
+
+The CTO X role rota runs inside this bot using the same Discord token, client,
+database volume, and deployment. Run `/setup_rota` in the channel where the
+live rota panel should be created. Existing panels are refreshed instead of
+duplicated where possible.
+
+Team members can join, assign Active or Backup roles, edit assignments, and
+manage the team from the persistent panel. Main Scheduler is limited to two
+active members.
+
+When team alerts are enabled, a critical role dropping to zero active coverage
+posts one alert in `REMINDERS_CHANNEL_ID`. The alert remains deduplicated until
+that role is covered and later becomes uncovered again. **Mention Me** controls
+whether a member is pinged in those channel alerts; it never sends a DM.
 
 ## Content, media, and X behavior
 

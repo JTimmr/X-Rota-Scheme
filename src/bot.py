@@ -40,6 +40,7 @@ async def main():
     async with bot:
         await bot.load_extension("cogs.schedule")
         await bot.load_extension("cogs.scheduler")
+        await bot.load_extension("cogs.role_rota")
         await bot.start(DISCORD_TOKEN)
 
 

@@ -15,6 +15,7 @@ propcache==0.5.2
 requests==2.34.2
 requests-oauthlib==2.0.0
 tweepy==4.17.0
+tzdata==2025.2
 typing_extensions==4.16.0
 urllib3==2.7.0
 yarl==1.24.5

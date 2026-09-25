@@ -601,8 +601,6 @@ def format_scheduled_message(
     unavailable: list[str] | None = None,
     skip_unclaimed_pings: bool = True,
     post_to_x: bool = True,
-    post_to_discord: bool = True,
-    discord_delay_minutes: int = 0,
 ) -> str:
     lines = [
         "**Scheduled Post**",
@@ -616,18 +614,6 @@ def format_scheduled_message(
         lines.append(
             "**Manual X** — the bot will not tweet this. Claimers post on X themselves; "
             "no tweet links are sent to announcement channels."
-        )
-        lines.append("")
-    elif not post_to_discord:
-        lines.append(
-            "**Discord live links off** — the bot will post to X but will not send "
-            "the x.com link to the configured live-link channels."
-        )
-        lines.append("")
-    elif discord_delay_minutes:
-        lines.append(
-            "**Discord live-link delay** — the x.com link will be sent "
-            f"{_format_discord_delay(discord_delay_minutes)} after X confirms publication."
         )
         lines.append("")
     lines.extend(
@@ -990,8 +976,6 @@ async def _scheduled_post_message_payload(
     unavailable = await get_unavailable_for_post(post_id)
     skip_pings = bool(post.get("skip_unclaimed_pings"))
     post_to_x = bool(post.get("post_to_x", 1))
-    post_to_discord = bool(post.get("post_to_discord", 1))
-    discord_delay_minutes = int(post.get("discord_delay_minutes", 0))
     return {
         "content": format_scheduled_message(
             post["content"],
@@ -1001,16 +985,12 @@ async def _scheduled_post_message_payload(
             unavailable,
             skip_unclaimed_pings=skip_pings,
             post_to_x=post_to_x,
-            post_to_discord=post_to_discord,
-            discord_delay_minutes=discord_delay_minutes,
         ),
         "embed": build_post_embed(post["content"]),
         "view": PostButtonView(
             bot,
             post_id,
             skip_unclaimed_pings=skip_pings,
-            post_to_discord=post_to_discord,
-            discord_delay_minutes=discord_delay_minutes,
         ),
         "allowed_mentions": discord.AllowedMentions.none(),
     }
@@ -1127,14 +1107,12 @@ class DiscordDelayPickerView(discord.ui.View):
         bot: commands.Bot,
         post_id: int,
         user_id: int,
-        schedule_message,
         current_delay_minutes: int,
     ):
         super().__init__(timeout=120)
         self.bot = bot
         self.post_id = post_id
         self.user_id = user_id
-        self.schedule_message = schedule_message
 
         select = discord.ui.Select(
             placeholder=(
@@ -1183,15 +1161,6 @@ class DiscordDelayPickerView(discord.ui.View):
             ),
             view=None,
         )
-        payload = await _scheduled_post_message_payload(self.bot, self.post_id)
-        if payload and self.schedule_message is not None:
-            try:
-                await self.schedule_message.edit(**payload)
-            except (discord.Forbidden, discord.HTTPException, discord.NotFound):
-                log.exception(
-                    "Post %s delay changed but its schedule card could not be updated",
-                    self.post_id,
-                )
         log.info(
             "Post %s discord_delay_minutes=%s (by %s)",
             self.post_id,
@@ -1210,6 +1179,140 @@ class DiscordDelayPickerView(discord.ui.View):
         return True
 
 
+class DiscordDeliverySettingsView(discord.ui.View):
+    """Ephemeral controls opened by one standard schedule-card button."""
+
+    def __init__(
+        self,
+        bot: commands.Bot,
+        post_id: int,
+        user_id: int,
+        post_to_discord: bool,
+        discord_delay_minutes: int,
+    ):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.post_id = post_id
+        self.user_id = user_id
+        self.post_to_discord = post_to_discord
+        self.discord_delay_minutes = discord_delay_minutes
+
+        toggle = discord.ui.Button(
+            label=(
+                "Turn Discord links off"
+                if post_to_discord
+                else "Turn Discord links on"
+            ),
+            style=(
+                discord.ButtonStyle.green
+                if post_to_discord
+                else discord.ButtonStyle.red
+            ),
+            custom_id=f"deliverytoggle:{post_id}",
+        )
+        toggle.callback = self._on_toggle
+        self.add_item(toggle)
+
+        delay = discord.ui.Button(
+            label="Change delay",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"deliverydelay:{post_id}",
+            disabled=not post_to_discord,
+        )
+        delay.callback = self._on_change_delay
+        self.add_item(delay)
+
+    def status_text(self) -> str:
+        if not self.post_to_discord:
+            return (
+                "**Discord live links are off.** Successful X links will not "
+                "be sent to the configured live-link channels."
+            )
+        return (
+            "**Discord live links are on.** Current delay: "
+            f"**{_format_discord_delay(self.discord_delay_minutes)}**."
+        )
+
+    async def _on_toggle(self, interaction: discord.Interaction):
+        async with get_schedule_refresh_lock(self.bot):
+            post = await get_post_by_id(self.post_id)
+            if not post or post.get("status", "scheduled") != "scheduled":
+                await interaction.response.edit_message(
+                    content="This post is no longer scheduled.",
+                    view=None,
+                )
+                self.stop()
+                return
+
+            post_to_discord = not bool(post.get("post_to_discord", 1))
+            delay_minutes = int(post.get("discord_delay_minutes", 0))
+            updated = await update_scheduled_post_discord_settings(
+                self.post_id,
+                post_to_discord,
+                delay_minutes,
+            )
+
+        if not updated:
+            await interaction.response.edit_message(
+                content="This post is no longer scheduled.",
+                view=None,
+            )
+            self.stop()
+            return
+
+        refreshed_view = DiscordDeliverySettingsView(
+            self.bot,
+            self.post_id,
+            self.user_id,
+            post_to_discord,
+            delay_minutes,
+        )
+        await interaction.response.edit_message(
+            content=refreshed_view.status_text(),
+            view=refreshed_view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+        log.info(
+            "Post %s post_to_discord=%s (by %s)",
+            self.post_id,
+            post_to_discord,
+            interaction.user.id,
+        )
+        self.stop()
+
+    async def _on_change_delay(self, interaction: discord.Interaction):
+        if not self.post_to_discord:
+            await interaction.response.edit_message(
+                content="Turn Discord live links on before choosing a delay.",
+                view=self,
+            )
+            return
+
+        await interaction.response.edit_message(
+            content=(
+                "Choose when successful X links should be sent to the "
+                "configured Discord live-link channels."
+            ),
+            view=DiscordDelayPickerView(
+                self.bot,
+                self.post_id,
+                self.user_id,
+                self.discord_delay_minutes,
+            ),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Only the person who opened these delivery settings can use them.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+
 class PostButtonView(discord.ui.View):
     """Buttons attached to each scheduled post message."""
 
@@ -1218,8 +1321,6 @@ class PostButtonView(discord.ui.View):
         bot: commands.Bot,
         post_id: int,
         skip_unclaimed_pings: bool = True,
-        post_to_discord: bool = True,
-        discord_delay_minutes: int = 0,
     ):
         super().__init__(timeout=None)
         self.bot = bot
@@ -1286,32 +1387,14 @@ class PostButtonView(discord.ui.View):
         cancel_btn.callback = self._on_cancel
         self.add_item(cancel_btn)
 
-        discord_btn = discord.ui.Button(
-            label=(
-                "Discord live links: on"
-                if post_to_discord
-                else "Discord live links: off"
-            ),
-            style=(
-                discord.ButtonStyle.green
-                if post_to_discord
-                else discord.ButtonStyle.red
-            ),
-            custom_id=f"postdiscord:{post_id}",
-            row=3,
-        )
-        discord_btn.callback = self._on_toggle_post_to_discord
-        self.add_item(discord_btn)
-
-        delay_btn = discord.ui.Button(
-            label="Change delay",
+        delivery_btn = discord.ui.Button(
+            label="Delivery options",
             style=discord.ButtonStyle.secondary,
-            custom_id=f"changedelay:{post_id}",
-            row=4,
-            disabled=not post_to_discord,
+            custom_id=f"deliveryoptions:{post_id}",
+            row=2,
         )
-        delay_btn.callback = self._on_change_discord_delay
-        self.add_item(delay_btn)
+        delivery_btn.callback = self._on_delivery_options
+        self.add_item(delivery_btn)
 
     async def _on_claim(self, interaction: discord.Interaction):
         uid = str(interaction.user.id)
@@ -1353,39 +1436,7 @@ class PostButtonView(discord.ui.View):
             ephemeral=True,
         )
 
-    async def _on_toggle_post_to_discord(
-        self,
-        interaction: discord.Interaction,
-    ):
-        async with get_schedule_refresh_lock(self.bot):
-            post = await get_post_by_id(self.post_id)
-            if not post or post.get("status", "scheduled") != "scheduled":
-                await interaction.response.send_message(
-                    "This post is no longer scheduled.",
-                    ephemeral=True,
-                )
-                return
-            post_to_discord = not bool(post.get("post_to_discord", 1))
-            updated = await update_scheduled_post_discord_settings(
-                self.post_id,
-                post_to_discord,
-                int(post.get("discord_delay_minutes", 0)),
-            )
-        if not updated:
-            await interaction.response.send_message(
-                "This post is no longer scheduled.",
-                ephemeral=True,
-            )
-            return
-        log.info(
-            "Post %s post_to_discord=%s (by %s)",
-            self.post_id,
-            post_to_discord,
-            interaction.user.id,
-        )
-        await self._update_message(interaction)
-
-    async def _on_change_discord_delay(
+    async def _on_delivery_options(
         self,
         interaction: discord.Interaction,
     ):
@@ -1397,19 +1448,16 @@ class PostButtonView(discord.ui.View):
             )
             return
 
-        current_delay = int(post.get("discord_delay_minutes", 0))
+        settings = DiscordDeliverySettingsView(
+            self.bot,
+            self.post_id,
+            interaction.user.id,
+            bool(post.get("post_to_discord", 1)),
+            int(post.get("discord_delay_minutes", 0)),
+        )
         await interaction.response.send_message(
-            (
-                "Choose when successful X links should be sent to the "
-                "configured Discord live-link channels."
-            ),
-            view=DiscordDelayPickerView(
-                self.bot,
-                self.post_id,
-                interaction.user.id,
-                interaction.message,
-                current_delay,
-            ),
+            settings.status_text(),
+            view=settings,
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -1473,8 +1521,6 @@ class PostButtonView(discord.ui.View):
         skip_pings = bool(post.get("skip_unclaimed_pings"))
 
         post_to_x = bool(post.get("post_to_x", 1))
-        post_to_discord = bool(post.get("post_to_discord", 1))
-        discord_delay_minutes = int(post.get("discord_delay_minutes", 0))
         new_content = format_scheduled_message(
             post["content"],
             post["scheduled_at"],
@@ -1483,15 +1529,11 @@ class PostButtonView(discord.ui.View):
             unavailable,
             skip_unclaimed_pings=skip_pings,
             post_to_x=post_to_x,
-            post_to_discord=post_to_discord,
-            discord_delay_minutes=discord_delay_minutes,
         )
         new_view = PostButtonView(
             self.bot,
             self.post_id,
             skip_unclaimed_pings=skip_pings,
-            post_to_discord=post_to_discord,
-            discord_delay_minutes=discord_delay_minutes,
         )
         await interaction.response.edit_message(
             content=new_content,
@@ -1675,10 +1717,6 @@ async def repost_all_scheduled(bot: commands.Bot) -> bool:
                 unavailable = await get_unavailable_for_post(post["id"])
                 skip_pings = bool(post.get("skip_unclaimed_pings"))
                 post_to_x = bool(post.get("post_to_x", 1))
-                post_to_discord = bool(post.get("post_to_discord", 1))
-                discord_delay_minutes = int(
-                    post.get("discord_delay_minutes", 0)
-                )
                 content = format_scheduled_message(
                     post["content"],
                     post["scheduled_at"],
@@ -1687,15 +1725,11 @@ async def repost_all_scheduled(bot: commands.Bot) -> bool:
                     unavailable,
                     skip_unclaimed_pings=skip_pings,
                     post_to_x=post_to_x,
-                    post_to_discord=post_to_discord,
-                    discord_delay_minutes=discord_delay_minutes,
                 )
                 view = PostButtonView(
                     bot,
                     post["id"],
                     skip_unclaimed_pings=skip_pings,
-                    post_to_discord=post_to_discord,
-                    discord_delay_minutes=discord_delay_minutes,
                 )
                 file = get_discord_file(post.get("image_path"))
                 send_kwargs = {

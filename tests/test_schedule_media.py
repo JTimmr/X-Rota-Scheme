@@ -425,34 +425,48 @@ class ScheduledEditMentionSafetyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_scheduled_post_can_toggle_and_delay_discord_links(self):
         bot = Mock()
-        off_view = schedule.PostButtonView(
+        public_view = schedule.PostButtonView(bot, post_id=1)
+        delivery_button = next(
+            item
+            for item in public_view.children
+            if isinstance(item, discord.ui.Button)
+            and item.custom_id == "deliveryoptions:1"
+        )
+        self.assertEqual(delivery_button.label, "Delivery options")
+        self.assertTrue(
+            all(
+                isinstance(item, discord.ui.Button)
+                for item in public_view.children
+            )
+        )
+        self.assertLessEqual(
+            max(item.row for item in public_view.children),
+            2,
+        )
+
+        off_view = schedule.DiscordDeliverySettingsView(
             bot,
             post_id=1,
+            user_id=999,
             post_to_discord=False,
             discord_delay_minutes=60,
-        )
-        discord_button = next(
-            item
-            for item in off_view.children
-            if isinstance(item, discord.ui.Button)
-            and item.custom_id == "postdiscord:1"
         )
         delay_button = next(
             item
             for item in off_view.children
             if isinstance(item, discord.ui.Button)
-            and item.custom_id == "changedelay:1"
+            and item.custom_id == "deliverydelay:1"
         )
         cancel_button = next(
             item
-            for item in off_view.children
+            for item in public_view.children
             if isinstance(item, discord.ui.Button)
             and item.custom_id == "cancelpost:1"
         )
-        self.assertIn("off", discord_button.label)
         self.assertTrue(delay_button.disabled)
         self.assertEqual(delay_button.label, "Change delay")
         self.assertEqual(cancel_button.label, "Cancel post")
+        self.assertIn("are off", off_view.status_text())
 
         post = {
             "id": 1,
@@ -465,8 +479,37 @@ class ScheduledEditMentionSafetyTests(unittest.IsolatedAsyncioTestCase):
             "post_to_discord": 1,
             "discord_delay_minutes": 0,
         }
-        delayed = {**post, "discord_delay_minutes": 60}
-        schedule_message = SimpleNamespace(edit=AsyncMock())
+        off_post = {
+            **post,
+            "post_to_discord": 0,
+            "discord_delay_minutes": 60,
+        }
+        toggle_interaction = SimpleNamespace(
+            user=SimpleNamespace(id=999),
+            response=SimpleNamespace(edit_message=AsyncMock()),
+        )
+        with (
+            patch.object(
+                schedule,
+                "get_post_by_id",
+                new=AsyncMock(return_value=off_post),
+            ),
+            patch.object(
+                schedule,
+                "update_scheduled_post_discord_settings",
+                new=AsyncMock(return_value=True),
+            ) as toggle_update,
+        ):
+            await off_view._on_toggle(toggle_interaction)
+
+        toggle_update.assert_awaited_once_with(1, True, 60)
+        self.assertIn(
+            "are on",
+            toggle_interaction.response.edit_message.await_args.kwargs[
+                "content"
+            ],
+        )
+
         interaction = SimpleNamespace(
             data={"values": ["60"]},
             user=SimpleNamespace(id=999),
@@ -481,35 +524,26 @@ class ScheduledEditMentionSafetyTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 schedule,
                 "get_post_by_id",
-                new=AsyncMock(side_effect=[post, delayed]),
+                new=AsyncMock(return_value=post),
             ),
             patch.object(
                 schedule,
                 "update_scheduled_post_discord_settings",
                 new=update,
             ),
-            patch.object(
-                schedule,
-                "get_claimers_for_post",
-                new=AsyncMock(return_value=[]),
-            ),
-            patch.object(
-                schedule,
-                "get_unavailable_for_post",
-                new=AsyncMock(return_value=[]),
-            ),
         ):
             await schedule.DiscordDelayPickerView(
                 bot,
                 post_id=1,
                 user_id=999,
-                schedule_message=schedule_message,
                 current_delay_minutes=0,
             )._on_select(interaction)
 
         update.assert_awaited_once_with(1, True, 60)
-        edited = schedule_message.edit.await_args
-        self.assertIn("1 hour", edited.kwargs["content"])
+        self.assertIn(
+            "1 hour",
+            interaction.response.edit_message.await_args.kwargs["content"],
+        )
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import discord
@@ -110,6 +110,12 @@ SECONDS_4_HOURS = 4 * 60 * 60
 SECONDS_24_HOURS = 24 * 60 * 60
 ALERT_KIND_FOUR_HOUR = "unclaimed_4h"
 ALERT_KIND_FIFTEEN_MINUTE = "pre_live_15m"
+
+
+def _daily_gap_minimum(utc_now: datetime) -> int:
+    """Require one post for the upcoming weekend day, otherwise two."""
+    upcoming_day = (utc_now + timedelta(days=1)).weekday()
+    return 1 if upcoming_day >= 5 else 2
 
 
 def _post_to_x(post: dict) -> bool:
@@ -609,8 +615,9 @@ class SchedulerCog(commands.Cog):
 
         now = int(time.time())
         upcoming = await get_scheduled_posts_in_range(now, now + SECONDS_24_HOURS)
+        minimum = _daily_gap_minimum(utc_now)
 
-        if len(upcoming) >= 2:
+        if len(upcoming) >= minimum:
             return
 
         reminders_channel = self.bot.get_channel(REMINDERS_CHANNEL_ID)
@@ -621,19 +628,23 @@ class SchedulerCog(commands.Cog):
         if count == 0:
             body = (
                 "**No posts** are scheduled for the next 24 hours! We need at "
-                f"least 2.\n\nUse `/schedule` in <#{SCHEDULED_CHANNEL_ID}> "
+                f"least {minimum}.\n\nUse `/schedule` in <#{SCHEDULED_CHANNEL_ID}> "
                 "to add posts."
             )
         else:
             body = (
                 f"Only **{count} post** is scheduled for the next 24 hours. "
-                f"We need at least 2.\n\nUse `/schedule` in "
+                f"We need at least {minimum}.\n\nUse `/schedule` in "
                 f"<#{SCHEDULED_CHANNEL_ID}> to add more."
             )
         if not await self._send_team_notification(reminders_channel, body):
             return
 
-        log.info(f"Gap detection alert: {count} posts in next 24h")
+        log.info(
+            "Gap detection alert: %s posts in next 24h (minimum=%s)",
+            count,
+            minimum,
+        )
 
 
 async def setup(bot: commands.Bot):

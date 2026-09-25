@@ -87,13 +87,19 @@ batch; as with any Discord-plus-SQLite workflow, a process crash in the narrow
 gap between send and record can still produce a duplicate. Skipped optional
 alerts and attempts with no target are not recorded.
 
+The 20:00 UTC next-24-hours gap check requires two scheduled posts when the
+upcoming day is Monday-Friday and one when it is Saturday or Sunday. It alerts
+only when the applicable minimum is not met.
+
 Content and media can be changed before go-live. Replacement media is fully
 validated before the database switches away from the old file; failed
 validation leaves the existing attachment intact. Each scheduled-post card
-also has a **Discord live links** toggle and **Change delay** button. The button
-opens its dropdown ephemerally instead of attaching a select menu to the public
-card. These controls affect only the configured live-link channels; schedule
-cards, archive records, and reminders remain available.
+keeps the established content/embed format and adds one standard **Delivery
+options** button alongside the existing controls. That button opens the
+Discord live-link toggle and **Change delay** controls ephemerally, so no
+dropdown or delivery-status text is attached to—or edited into—the public card.
+These controls affect only the configured live-link channels; schedule cards,
+archive records, and reminders remain available.
 
 The explicit **Cancel post** button and confirmation soft-cancel a post: its
 claims, availability, media reference, and settings remain in SQLite. A

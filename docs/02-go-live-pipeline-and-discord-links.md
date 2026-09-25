@@ -89,7 +89,8 @@ That last point is community operations, not a current "author replies back" coe
 
 Do not wait for the historical caption backfill. The pipeline can be tested on ordinary upcoming slots, with content held as similar as it already is.
 
-Use the three live-link settings available while scheduling and on each scheduled-post card:
+Use the three live-link settings available while scheduling and through each
+scheduled-post card's **Delivery options** button:
 
 1. **No Discord live links** — X post, archive, reminders; link channels silent.
 2. **Delayed Discord links** — same X post; URL hits chats after a chosen lag (30–60 minutes is a reasonable first band; 3 hours is a second band).

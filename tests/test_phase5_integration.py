@@ -6,7 +6,7 @@ import tempfile
 import time
 import types
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
@@ -199,6 +199,90 @@ class PanelDatabaseIntegrationTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 database.DB_PATH = original_db_path
                 database.IMAGES_DIR = original_images_dir
+
+
+class DailyGapNotificationTests(unittest.IsolatedAsyncioTestCase):
+    def test_minimum_is_one_for_upcoming_weekend_days(self):
+        friday = datetime(2026, 9, 25, 20, tzinfo=timezone.utc)
+        saturday = datetime(2026, 9, 26, 20, tzinfo=timezone.utc)
+        sunday = datetime(2026, 9, 27, 20, tzinfo=timezone.utc)
+
+        self.assertEqual(scheduler._daily_gap_minimum(friday), 1)
+        self.assertEqual(scheduler._daily_gap_minimum(saturday), 1)
+        self.assertEqual(scheduler._daily_gap_minimum(sunday), 2)
+
+    async def test_weekend_with_one_post_does_not_notify(self):
+        friday = datetime(2026, 9, 25, 20, tzinfo=timezone.utc)
+        bot = Mock()
+        cog = scheduler.SchedulerCog(bot)
+        cog._send_team_notification = AsyncMock(return_value=True)
+
+        with (
+            patch.object(
+                scheduler,
+                "datetime",
+                SimpleNamespace(now=Mock(return_value=friday)),
+            ),
+            patch.object(
+                scheduler,
+                "get_scheduled_posts_in_range",
+                new=AsyncMock(return_value=[{"id": 1}]),
+            ),
+        ):
+            await cog._check_daily_gap()
+
+        cog._send_team_notification.assert_not_awaited()
+        bot.get_channel.assert_not_called()
+
+    async def test_weekend_with_no_posts_notifies_for_minimum_one(self):
+        friday = datetime(2026, 9, 25, 20, tzinfo=timezone.utc)
+        reminders = object()
+        bot = Mock()
+        bot.get_channel.return_value = reminders
+        cog = scheduler.SchedulerCog(bot)
+        cog._send_team_notification = AsyncMock(return_value=True)
+
+        with (
+            patch.object(
+                scheduler,
+                "datetime",
+                SimpleNamespace(now=Mock(return_value=friday)),
+            ),
+            patch.object(
+                scheduler,
+                "get_scheduled_posts_in_range",
+                new=AsyncMock(return_value=[]),
+            ),
+        ):
+            await cog._check_daily_gap()
+
+        sent = cog._send_team_notification.await_args
+        self.assertIn("at least 1", sent.args[1])
+
+    async def test_weekday_still_requires_two_posts(self):
+        sunday = datetime(2026, 9, 27, 20, tzinfo=timezone.utc)
+        reminders = object()
+        bot = Mock()
+        bot.get_channel.return_value = reminders
+        cog = scheduler.SchedulerCog(bot)
+        cog._send_team_notification = AsyncMock(return_value=True)
+
+        with (
+            patch.object(
+                scheduler,
+                "datetime",
+                SimpleNamespace(now=Mock(return_value=sunday)),
+            ),
+            patch.object(
+                scheduler,
+                "get_scheduled_posts_in_range",
+                new=AsyncMock(return_value=[{"id": 1}]),
+            ),
+        ):
+            await cog._check_daily_gap()
+
+        sent = cog._send_team_notification.await_args
+        self.assertIn("at least 2", sent.args[1])
 
 
 class ClaimNotificationIntegrationTests(unittest.IsolatedAsyncioTestCase):
